@@ -145,7 +145,7 @@ def generate_summary(model, tokenizer, batch, device,
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    CHECKPOINT_PATH = "/dev/shm/karan/checkpoints/gramformer_v2_latest.pt"
+    CHECKPOINT_PATH = "/tmp/uday/checkpoints/gramformer_v2_latest.pt"
 
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("roberta-base")
@@ -181,7 +181,7 @@ def main():
     model.eval()
 
     # ── Load one test movie ───────────────────────────────────────────────────
-    eval_data_path = "/tmp/karan/mensa_test_data.jsonl.gz"
+    eval_data_path = "/tmp/uday/mensa_test_data.jsonl.gz"
     print(f"\nLoading test movie from {eval_data_path}...")
 
     movie_scenes = []

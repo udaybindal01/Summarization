@@ -33,8 +33,8 @@ import torch._dynamo
 
 torch._dynamo.config.cache_size_limit = 512
 os.environ["USE_TORCH"] = "1"
-os.environ["TMPDIR"]    = "/dev/shm/karan"
-sys.path.insert(0, "/tmp/karan/lib")
+os.environ["TMPDIR"]    = "/tmp/uday"
+sys.path.insert(0, "/tmp/uday/lib")
 
 from peft import LoraConfig, get_peft_model
 import sum as _sum_module
@@ -55,8 +55,8 @@ import argparse as _ap
 _parser = _ap.ArgumentParser(add_help=False)
 _parser.add_argument("--run_name",           type=str,   default="full_model")
 _parser.add_argument("--bart_model", type=str,
-                     default=("/tmp/karan/bart-large"
-                              if __import__("os").path.isdir("/tmp/karan/bart-large")
+                     default=("/tmp/uday/bart-large"
+                              if __import__("os").path.isdir("/tmp/uday/bart-large")
                               else "facebook/bart-large"))
 _parser.add_argument("--bart_tokenizer", type=str, default="",
                      help="Explicit tokenizer path/name (defaults to bart_model)")
@@ -95,13 +95,13 @@ ABLATION = {
     "dataset":             _args.dataset,
 }
 
-JSONL_PATH       = "/tmp/karan/mensa_train_data.jsonl.gz"
-MOVIESUM_PATH    = "/tmp/karan/moviesum_data.jsonl.gz"
+JSONL_PATH       = "/tmp/uday/mensa_train_data.jsonl.gz"
+MOVIESUM_PATH    = "/tmp/uday/moviesum_data.jsonl.gz"
 # Splits live on real disk (/tmp), NOT /dev/shm (RAM disk).
 # Uncompressed splits at 512-dim adj matrices = 74GB+ which fills RAM.
 # We use gzip compression — reads slightly slower but 10x smaller on disk.
-TRAIN_SPLIT_PATH = f"/tmp/karan/train_{ABLATION['run_name']}.jsonl.gz"
-EVAL_SPLIT_PATH  = f"/tmp/karan/eval_{ABLATION['run_name']}.jsonl.gz"
+TRAIN_SPLIT_PATH = f"/tmp/uday/train_{ABLATION['run_name']}.jsonl.gz"
+EVAL_SPLIT_PATH  = f"/tmp/uday/eval_{ABLATION['run_name']}.jsonl.gz"
 NUM_TRAIN_MOVIES = 700
 
 BATCH_SIZE         = 1
@@ -585,7 +585,7 @@ def train():
         print("ABLATION: pointer head disabled (p_gen=1 always)")
 
     # ── 4. Checkpoint resumption ──────────────────────────────────────────────
-    ckpt_path   = "/dev/shm/karan/checkpoints/gramformer_v2_latest.pt"
+    ckpt_path   = "/tmp/uday/checkpoints/gramformer_v2_latest.pt"
     start_epoch = 0
     checkpoint  = None
     if os.path.exists(ckpt_path):
@@ -926,7 +926,7 @@ def train():
         })
 
         # ── Save checkpoint ──────────────────────────────────────────────────
-        save_dir  = "/dev/shm/karan/checkpoints"
+        save_dir  = "/tmp/uday/checkpoints"
         os.makedirs(save_dir, exist_ok=True)
         ckpt_save = f"{save_dir}/gramformer_v2_epoch_{epoch + 1}.pt"
         torch.save({

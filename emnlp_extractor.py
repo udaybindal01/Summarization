@@ -280,7 +280,7 @@ def main():
     parser.add_argument("--start",   type=int, default=0)
     parser.add_argument("--end",     type=int, default=-1)
     parser.add_argument("--out",     type=str,
-                        default="/tmp/karan/mensa_train_data.jsonl.gz")
+                        default="/tmp/uday/mensa_train_data.jsonl.gz")
     parser.add_argument("--dataset", type=str, default="mensa",
                         choices=["mensa", "moviesum"],
                         help="Which dataset to extract from")

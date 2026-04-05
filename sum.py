@@ -50,8 +50,8 @@ import seaborn as sns
 # Load from local path — avoids network hang on restricted servers.
 # Falls back to HuggingFace hub if local path not found.
 import os as _os
-_BART_LARGE_LOCAL = "/tmp/karan/bart-large"
-_BART_BASE_LOCAL  = "/tmp/karan/bart-base"
+_BART_LARGE_LOCAL = "/tmp/uday/bart-large"
+_BART_BASE_LOCAL  = "/tmp/uday/bart-base"
 
 BART_MODEL = (_BART_LARGE_LOCAL if _os.path.isdir(_BART_LARGE_LOCAL)
               else "facebook/bart-large")

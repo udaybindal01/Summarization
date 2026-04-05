@@ -13,13 +13,13 @@ Converts raw MENSA/MovieSum HuggingFace datasets into compressed JSONL feature f
 
 ```bash
 # Extract MENSA training data (supports sharding with --start/--end)
-python emnlp_extractor.py --dataset mensa --out /tmp/karan/mensa_train_data.jsonl.gz
+python emnlp_extractor.py --dataset mensa --out /tmp/uday/mensa_train_data.jsonl.gz
 
 # Extract a slice (for parallel runs)
-python emnlp_extractor.py --start 0 --end 5000 --out /tmp/karan/shard_0.jsonl.gz
+python emnlp_extractor.py --start 0 --end 5000 --out /tmp/uday/shard_0.jsonl.gz
 
 # Extract MovieSum
-python emnlp_extractor.py --dataset moviesum --out /tmp/karan/moviesum_data.jsonl.gz
+python emnlp_extractor.py --dataset moviesum --out /tmp/uday/moviesum_data.jsonl.gz
 ```
 
 ### 2. Training (`train.py`)
@@ -38,13 +38,13 @@ python train.py --run_name ablation_single_graph --single_binary_graph
 --dataset mensa|moviesum|both
 ```
 
-Checkpoints are saved to `/dev/shm/karan/checkpoints/` (RAM disk for speed).
+Checkpoints are saved to `/tmp/uday/checkpoints/` (RAM disk for speed).
 
 ### 3. Inference (`inference.py`)
 ```bash
 python inference.py
 # Edit CHECKPOINT_PATH inside main() to point to the desired checkpoint
-# Reads test data from /tmp/karan/mensa_test_data.jsonl.gz
+# Reads test data from /tmp/uday/mensa_test_data.jsonl.gz
 ```
 
 ### 4. Evaluation (`eval.py`)
@@ -64,7 +64,7 @@ python eval.py
 - **HierarchicalPointerHead v2**: Dual-level copy mechanism (scene attention + entity salience).
 - **Losses**: `RelationalEventConsistencyLoss` (label-smoothed entity NLL) + `NarrativeCoherenceLoss` (scene-pair NT-Xent over encoder scene reps; positive pairs = scenes sharing a causal edge within the movie).
 
-BART backbone: defaults to `facebook/bart-large` (d_model=1024). Can switch to `facebook/bart-base` (d_model=768) via `--bart_model` flag. Local path `/tmp/karan/bart-large` is checked first to avoid network access. Tokenizer defaults to `bart_model` but can be set independently via `--bart_tokenizer`. The extraction pipeline (`emnlp_extractor.py`) and dataset loader both use the BART tokenizer to ensure decoder start token semantics match (C1/C2).
+BART backbone: defaults to `facebook/bart-large` (d_model=1024). Can switch to `facebook/bart-base` (d_model=768) via `--bart_model` flag. Local path `/tmp/uday/bart-large` is checked first to avoid network access. Tokenizer defaults to `bart_model` but can be set independently via `--bart_tokenizer`. The extraction pipeline (`emnlp_extractor.py`) and dataset loader both use the BART tokenizer to ensure decoder start token semantics match (C1/C2).
 
 ## Data Format (`mensa.py` / JSONL)
 
@@ -83,12 +83,12 @@ Movies are grouped in the collate function (`movie_collate_fn` in `train.py`) in
 
 | Path | Purpose |
 |------|---------|
-| `/tmp/karan/` | Main data directory |
-| `/dev/shm/karan/` | RAM disk — checkpoints, fast I/O |
-| `/tmp/karan/bart-large` | Local BART-large weights |
-| `/tmp/karan/mensa_train_data.jsonl.gz` | Extracted train features |
-| `/tmp/karan/mensa_test_data.jsonl.gz` | Extracted test features |
-| `/dev/shm/karan/checkpoints/` | Model checkpoints |
+| `/tmp/uday/` | Main data directory |
+| `/tmp/uday/` | RAM disk — checkpoints, fast I/O |
+| `/tmp/uday/bart-large` | Local BART-large weights |
+| `/tmp/uday/mensa_train_data.jsonl.gz` | Extracted train features |
+| `/tmp/uday/mensa_test_data.jsonl.gz` | Extracted test features |
+| `/tmp/uday/checkpoints/` | Model checkpoints |
 
 ## Dependencies
 
