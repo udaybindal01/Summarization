@@ -3,10 +3,9 @@ train.py  —  GraM-Former v2 Training Pipeline
 ==============================================
 Key changes over v1
 -------------------
-  - MovieGraphDatasetV2  builds THREE typed adjacency matrices per movie:
+  - MovieGraphDatasetV2  builds TWO typed adjacency matrices per movie:
       causal_adj       (directed SVO causal chains)
       char_state_adj   (weighted by emotion-state-change magnitude)
-      discourse_adj    (act/beat structure from scene_meta)
   - IDF weights computed per-movie over entity co-occurrences
   - Separate learning-rate groups (encoder LoRA vs new layers)
   - Label-smoothing loss + graduated entity penalty (α_entity schedule)
@@ -59,10 +58,11 @@ _parser.add_argument("--bart_model", type=str,
                      default=("/tmp/karan/bart-large"
                               if __import__("os").path.isdir("/tmp/karan/bart-large")
                               else "facebook/bart-large"))
+_parser.add_argument("--bart_tokenizer", type=str, default="",
+                     help="Explicit tokenizer path/name (defaults to bart_model)")
 _parser.add_argument("--d_model",            type=int,   default=1024)
 _parser.add_argument("--no_causal_graph",    action="store_true")
 _parser.add_argument("--no_char_state_graph",action="store_true")
-_parser.add_argument("--no_discourse_graph", action="store_true")
 _parser.add_argument("--no_coherence_loss",  action="store_true")
 _parser.add_argument("--no_contrastive_loss",action="store_true")
 _parser.add_argument("--no_pointer_head",    action="store_true")
@@ -75,13 +75,17 @@ _args, _ = _parser.parse_known_args()
 
 # Ablation flags — each flag disables one component for ablation experiments.
 # Run with e.g.:  python train.py --run_name ablation_no_causal --no_causal_graph
+# C2: explicit BART tokenizer — falls back to bart_model path
+_BART_TOKENIZER = _args.bart_tokenizer or _args.bart_model
+
 ABLATION = {
     "run_name":            _args.run_name,
     "bart_model":          _args.bart_model,
+    "bart_tokenizer":      _BART_TOKENIZER,
     "d_model":             _args.d_model,
     "use_causal_graph":    not _args.no_causal_graph,
     "use_char_state_graph":not _args.no_char_state_graph,
-    "use_discourse_graph": not _args.no_discourse_graph,
+
     "use_coherence_loss":  not _args.no_coherence_loss,
     "use_contrastive_loss":not _args.no_contrastive_loss,
     "use_pointer_head":    not _args.no_pointer_head,
@@ -118,7 +122,9 @@ class MensaGraphDataset(Dataset):
     def __init__(self, jsonl_path, max_seq_len=256):
         self.max_seq_len = max_seq_len
         self.jsonl_path  = jsonl_path
-        self.tokenizer   = AutoTokenizer.from_pretrained("roberta-base")
+        # C2: use BART tokenizer — same BPE vocab as RoBERTa, but explicit
+        # decoder_start_token_id=2 semantics match the model's teacher forcing.
+        self.tokenizer   = AutoTokenizer.from_pretrained(_BART_TOKENIZER)
         self.movie_ids   = []
 
         # Index-only pass: store byte offsets so __getitem__ can seek
@@ -152,15 +158,6 @@ class MensaGraphDataset(Dataset):
                     self._lines.append(line)
                     self.movie_ids.append(mid)
             print(f"Indexed {len(self._lines)} scenes.")
-
-    @property
-    def data(self):
-        # Legacy compatibility — returns parsed items on demand
-        # Only used by MovieGraphDatasetV2 which calls scene_dataset[i]
-        return self  # __getitem__ handles parsing
-
-    def __len__(self):
-        return len(self.data)
 
     def __len__(self):
         return len(self._lines)
@@ -231,14 +228,13 @@ class MovieGraphDatasetV2(Dataset):
         S             = self.max_scenes
 
         if movie_name in self.adj_cache:
-            causal_adj, char_state_adj, discourse_adj, idf_weights = self.adj_cache[movie_name]
+            causal_adj, char_state_adj, idf_weights = self.adj_cache[movie_name]
             return {
-                "movie_name":    movie_name,
-                "scenes":        scenes,
-                "causal_adj":    causal_adj,
+                "movie_name":     movie_name,
+                "scenes":         scenes,
+                "causal_adj":     causal_adj,
                 "char_state_adj": char_state_adj,
-                "discourse_adj": discourse_adj,
-                "idf_weights":   idf_weights,
+                "idf_weights":    idf_weights,
             }
 
         # ── Graph 1: Causal Event Graph ─────────────────────────────────────
@@ -289,27 +285,6 @@ class MovieGraphDatasetV2(Dataset):
                 char_state_adj[i, j] = weight
                 char_state_adj[j, i] = weight
 
-        # ── Graph 3: Discourse Structure Graph ──────────────────────────────
-        # Connects scenes within the same "act" block (INT/EXT transitions
-        # and dialogue-density similarity)
-        discourse_adj = torch.zeros(S, S)
-        discourse_adj.fill_diagonal_(1.0)
-
-        metas = [scenes[i]["scene_meta"] for i in range(num_scenes)]
-        for i in range(num_scenes):
-            for j in range(i + 1, num_scenes):
-                mi, mj = metas[i], metas[j]
-                # Same interior/exterior type
-                same_int = mi.get("has_int", False) == mj.get("has_int", False)
-                same_ext = mi.get("has_ext", False) == mj.get("has_ext", False)
-                # Similar dialogue density (within 0.2)
-                dd_sim = abs(mi.get("dialogue_density", 0.5) -
-                             mj.get("dialogue_density", 0.5)) < 0.2
-                if (same_int or same_ext) and dd_sim:
-                    w = 1.0 if (same_int and same_ext and dd_sim) else 0.5
-                    discourse_adj[i, j] = w
-                    discourse_adj[j, i] = w
-
         # ── IDF weights over entity co-occurrences ──────────────────────────
         # idf(entity) = log(N / df) where df = #scenes containing entity
         all_entities = defaultdict(int)
@@ -341,14 +316,12 @@ class MovieGraphDatasetV2(Dataset):
                     idf_weights[i, j] = avg_idf
                     idf_weights[j, i] = avg_idf
 
-        self.adj_cache[movie_name] = (causal_adj, char_state_adj,
-                                       discourse_adj, idf_weights)
+        self.adj_cache[movie_name] = (causal_adj, char_state_adj, idf_weights)
         return {
             "movie_name":     movie_name,
             "scenes":         scenes,
             "causal_adj":     causal_adj,
             "char_state_adj": char_state_adj,
-            "discourse_adj":  discourse_adj,
             "idf_weights":    idf_weights,
         }
 
@@ -372,7 +345,6 @@ def movie_collate_fn(batch):
 
     causal_adj_b     = torch.zeros((B, max_scenes, max_scenes))
     char_state_adj_b = torch.zeros((B, max_scenes, max_scenes))
-    discourse_adj_b  = torch.zeros((B, max_scenes, max_scenes))
     idf_weights_b    = torch.zeros((B, max_scenes, max_scenes))
 
     all_triplets = []
@@ -401,22 +373,20 @@ def movie_collate_fn(batch):
 
         causal_adj_b[b, :ns, :ns]     = item["causal_adj"][:ns, :ns]
         char_state_adj_b[b, :ns, :ns] = item["char_state_adj"][:ns, :ns]
-        discourse_adj_b[b, :ns, :ns]  = item["discourse_adj"][:ns, :ns]
         idf_weights_b[b, :ns, :ns]    = item["idf_weights"][:ns, :ns]
 
     return {
-        "input_ids":     input_ids,
-        "target_ids":    target_ids,
-        "adj_matrix":    adj_matrix,
-        "action_mask":   action_mask,
-        "dial_mask":     dial_mask,
-        "ent_mask":      ent_mask,
-        "head_mask":     head_mask,
-        "causal_adj":    causal_adj_b,
+        "input_ids":      input_ids,
+        "target_ids":     target_ids,
+        "adj_matrix":     adj_matrix,
+        "action_mask":    action_mask,
+        "dial_mask":      dial_mask,
+        "ent_mask":       ent_mask,
+        "head_mask":      head_mask,
+        "causal_adj":     causal_adj_b,
         "char_state_adj": char_state_adj_b,
-        "discourse_adj": discourse_adj_b,
-        "idf_weights":   idf_weights_b,
-        "triplets":      all_triplets,
+        "idf_weights":    idf_weights_b,
+        "triplets":       all_triplets,
     }
 
 
@@ -512,7 +482,7 @@ def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
                 )
                 for ng in ngrams:
                     if len(ng) == 3:
-                        log_probs[ng[-1]] = -float("inf")
+                        log_probs[ng[-1]] = -1e4  # F7: avoid -inf NaN in bfloat16
 
             top_vals, top_idx = log_probs.topk(beam_size)
             for v, idx in zip(top_vals.tolist(), top_idx.tolist()):
@@ -597,8 +567,9 @@ def train():
     print(f"Model backbone: {ABLATION['bart_model']}  d_model={ABLATION['d_model']}")
 
     print("Xavier init on new layers...")
+    _skip_init = {"embedding", "head", "roberta", "scene_proj"}
     for name, param in model.named_parameters():
-        if param.requires_grad and "embedding" not in name and "head" not in name:
+        if param.requires_grad and not any(s in name for s in _skip_init):
             if len(param.shape) > 1:
                 torch.nn.init.xavier_uniform_(param)
 
@@ -636,19 +607,29 @@ def train():
         lora_applied  = True
         model.enable_gradient_checkpointing()
 
+    def _freeze_roberta(model):
+        """RoBERTa stays frozen throughout all training stages."""
+        for name, param in model.named_parameters():
+            if "roberta" in name:
+                param.requires_grad = False
+
     if start_epoch >= EPOCHS_STAGE1:
         apply_lora(r=64, alpha=128)
         for name, param in model.named_parameters():
-            if "bart_decoder.layers" in name and "encoder_attn" not in name:
+            if "roberta" in name:
+                param.requires_grad = False          # A1: always frozen
+            elif "bart_decoder.layers" in name and "encoder_attn" not in name:
                 param.requires_grad = False
             elif name.startswith("head."):
                 param.requires_grad = False
             else:
                 param.requires_grad = True
     else:
-        # Freeze encoder, train everything else
+        # Stage 1: freeze Mamba encoder and RoBERTa, train everything else
         for name, param in model.named_parameters():
-            param.requires_grad = "encoder" not in name
+            param.requires_grad = (
+                "encoder" not in name and "roberta" not in name
+            )
 
     if checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
@@ -687,8 +668,27 @@ def train():
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
-    # ROUGE evaluator
-    rouge = hf_evaluate.load("rouge")
+    # N1: evaluation metrics — ROUGE, BERTScore, METEOR
+    rouge      = hf_evaluate.load("rouge")
+    bertscore  = hf_evaluate.load("bertscore")
+    meteor     = hf_evaluate.load("meteor")
+
+    # N2: entity F1 — use a minimal spaCy NER pipeline (en_core_web_sm)
+    import spacy as _spacy
+    _nlp_ner = _spacy.load("en_core_web_sm", disable=["parser", "tagger", "lemmatizer"])
+
+    def _entity_f1(preds, refs):
+        """Micro-averaged entity F1 using spaCy NER on preds vs refs."""
+        tp = fp = fn = 0
+        for pred, ref in zip(preds, refs):
+            p_ents = {e.text.lower() for e in _nlp_ner(pred).ents}
+            r_ents = {e.text.lower() for e in _nlp_ner(ref).ents}
+            tp += len(p_ents & r_ents)
+            fp += len(p_ents - r_ents)
+            fn += len(r_ents - p_ents)
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        return (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
 
     # ── 8. Training loop ──────────────────────────────────────────────────────
     for epoch in range(start_epoch, EPOCHS):
@@ -707,10 +707,12 @@ def train():
 
         # Stage transition
         if epoch == EPOCHS_STAGE1 and not lora_applied:
-            print("→ Transitioning to Stage 2: applying LoRA to encoder")
+            print("→ Transitioning to Stage 2: applying LoRA to Mamba encoder")
             apply_lora(r=16, alpha=32)
             for name, param in model.named_parameters():
-                if "encoder" not in name:
+                if "roberta" in name:
+                    param.requires_grad = False      # A1: keep frozen
+                elif "encoder" not in name:
                     param.requires_grad = True
             optimizer = _make_optimizer(model)
             scaler    = torch.cuda.amp.GradScaler(enabled=False)
@@ -736,7 +738,6 @@ def train():
             h_mask  = batch["head_mask"].to(device)
             c_adj   = batch["causal_adj"].to(device)
             cs_adj  = batch["char_state_adj"].to(device)
-            dc_adj  = batch["discourse_adj"].to(device)
             idf_w   = batch["idf_weights"].to(device)
             tgt     = batch["target_ids"].to(device)
             trips   = batch["triplets"]
@@ -746,18 +747,16 @@ def train():
                 c_adj  = torch.zeros_like(c_adj)
             if not ABLATION["use_char_state_graph"]:
                 cs_adj = torch.zeros_like(cs_adj)
-            if not ABLATION["use_discourse_graph"]:
-                dc_adj = torch.zeros_like(dc_adj)
             if ABLATION["single_binary_graph"]:
-                # Collapse all three graphs to a single binary co-occurrence adj
+                # Collapse both graphs to a single binary co-occurrence adj
                 # (v1 baseline — tests whether typed graphs help over binary)
-                binary = ((c_adj + cs_adj + dc_adj) > 0).float()
-                c_adj = cs_adj = dc_adj = binary
+                binary = ((c_adj + cs_adj) > 0).float()
+                c_adj = cs_adj = binary
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits, enc_mem, labels, dec_hidden, gated_causal = model(
+                logits, enc_mem, labels, _, gated_causal = model(
                     inp, adj_m, a_mask, d_mask, e_mask, h_mask,
-                    c_adj, cs_adj, dc_adj, tgt, trips, idf_w
+                    c_adj, cs_adj, tgt, trips, idf_w
                 )
                 logits = logits.float()
                 loss   = criterion(
@@ -766,7 +765,7 @@ def train():
                     triplets=trips,
                     hidden_states=enc_mem,
                     head_weight=model.head.weight,
-                    decoder_hidden=dec_hidden,
+
                     causal_adj=gated_causal,
                 )
                 ortho = criterion.get_riemannian_orthogonality_loss(model)
@@ -819,7 +818,6 @@ def train():
                 h_mask = batch["head_mask"].to(device)
                 c_adj  = batch["causal_adj"].to(device)
                 cs_adj = batch["char_state_adj"].to(device)
-                dc_adj = batch["discourse_adj"].to(device)
                 idf_w  = batch["idf_weights"].to(device)
                 tgt    = batch["target_ids"].to(device)
                 trips  = batch["triplets"]
@@ -828,16 +826,14 @@ def train():
                     c_adj  = torch.zeros_like(c_adj)
                 if not ABLATION["use_char_state_graph"]:
                     cs_adj = torch.zeros_like(cs_adj)
-                if not ABLATION["use_discourse_graph"]:
-                    dc_adj = torch.zeros_like(dc_adj)
                 if ABLATION["single_binary_graph"]:
-                    binary = ((c_adj + cs_adj + dc_adj) > 0).float()
-                    c_adj = cs_adj = dc_adj = binary
+                    binary = ((c_adj + cs_adj) > 0).float()
+                    c_adj = cs_adj = binary
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits, enc_mem, labels, dec_hidden, gated_causal = model(
+                    logits, enc_mem, labels, _, gated_causal = model(
                         inp, adj_m, a_mask, d_mask, e_mask, h_mask,
-                        c_adj, cs_adj, dc_adj, tgt, trips, idf_w
+                        c_adj, cs_adj, tgt, trips, idf_w
                     )
                     logits  = logits.float()
                     e_loss  = criterion(
@@ -846,7 +842,7 @@ def train():
                         triplets=trips,
                         hidden_states=enc_mem,
                         head_weight=model.head.weight,
-                        decoder_hidden=dec_hidden,
+    
                         causal_adj=gated_causal,
                     )
 
@@ -857,7 +853,7 @@ def train():
                 if batch_idx % 10 == 0:
                     aligned_mem, _ = model(
                         inp, adj_m, a_mask, d_mask, e_mask, h_mask,
-                        c_adj, cs_adj, dc_adj,
+                        c_adj, cs_adj,
                         target_ids=None, triplets=None, idf_weights=idf_w,
                     )
                     mem_pad_mask  = (inp[:, :, 0] == 1)
@@ -881,7 +877,7 @@ def train():
                     })
 
                     if batch_idx % 50 == 0:
-                        log_character_attention_map(model, enc_mem, c_adj, dc_adj)
+                        log_character_attention_map(model, enc_mem, c_adj)
                         log_character_attention_map_labeled(
                             model, enc_mem, c_adj, trips
                         )
@@ -890,21 +886,32 @@ def train():
 
         # ── ROUGE ────────────────────────────────────────────────────────────
         rouge_scores = {}
+        bs_f1 = met_score = ent_f1 = 0.0
         if all_preds:
             rouge_scores = rouge.compute(
-                predictions=all_preds,
-                references=all_refs,
-                use_stemmer=True,
+                predictions=all_preds, references=all_refs, use_stemmer=True,
             )
+            # N1: BERTScore (deberta-xlarge-mnli is slow; use roberta-large)
+            bs_out   = bertscore.compute(
+                predictions=all_preds, references=all_refs,
+                lang="en", model_type="roberta-large",
+            )
+            bs_f1    = sum(bs_out["f1"]) / max(len(bs_out["f1"]), 1)
+            # N1: METEOR
+            met_score = meteor.compute(
+                predictions=all_preds, references=all_refs,
+            )["meteor"]
+            # N2: entity F1
+            ent_f1 = _entity_f1(all_preds, all_refs)
 
         r1 = rouge_scores.get("rouge1", 0.0)
         r2 = rouge_scores.get("rouge2", 0.0)
         rL = rouge_scores.get("rougeL", 0.0)
 
         print(f"Epoch {epoch + 1} | "
-              f"Train {avg_train_loss:.4f} | "
-              f"Eval {avg_eval_loss:.4f} | "
-              f"R1 {r1:.4f} | R2 {r2:.4f} | RL {rL:.4f}")
+              f"Train {avg_train_loss:.4f} | Eval {avg_eval_loss:.4f} | "
+              f"R1 {r1:.4f} | R2 {r2:.4f} | RL {rL:.4f} | "
+              f"BS-F1 {bs_f1:.4f} | METEOR {met_score:.4f} | EntF1 {ent_f1:.4f}")
 
         wandb.log({
             "epoch_train_loss": avg_train_loss,
@@ -912,6 +919,9 @@ def train():
             "rouge1":           r1,
             "rouge2":           r2,
             "rougeL":           rL,
+            "bertscore_f1":     bs_f1,
+            "meteor":           met_score,
+            "entity_f1":        ent_f1,
             "epoch":            epoch + 1,
         })
 

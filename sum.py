@@ -39,7 +39,7 @@ from torch.utils.checkpoint import checkpoint
 import random
 import math
 import wandb
-from transformers import BartForConditionalGeneration
+from transformers import BartForConditionalGeneration, RobertaModel
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -115,6 +115,7 @@ class GraMambaLayer(nn.Module):
                         device=x.device, dtype=torch.float32)
         history_list  = []
         scan_outputs  = []
+        adj_float = adjacency_matrix.float()  # cast once — avoids per-step dtype conversion
 
         for t in range(seq_len):
             delta_t = delta[:, t].unsqueeze(-1)
@@ -123,9 +124,9 @@ class GraMambaLayer(nn.Module):
             h       = h * torch.exp(-delta_t) + (B_t * x_t)
 
             if t > 0:
-                causal_weights = adjacency_matrix[:, t, :t]
+                causal_weights = adj_float[:, t, :t]
                 if causal_weights.any():
-                    w     = causal_weights.view(batch, t, 1, 1).float()
+                    w     = causal_weights.view(batch, t, 1, 1)
                     hist  = torch.stack(history_list, dim=1)
                     deg   = w.sum(dim=1).clamp(min=1.0)
                     g_ctx = (w * hist).sum(dim=1) / deg
@@ -215,14 +216,13 @@ class RaftConsensusAttentionV2(nn.Module):
 
 class HeterogeneousGraphTransformer(nn.Module):
     """
-    Fuses three typed movie-level graphs:
-      0 = Causal Event Graph
-      1 = Character State Graph
-      2 = Discourse Structure Graph
+    Fuses two typed movie-level graphs:
+      0 = Causal Event Graph  (directed SVO causal chains)
+      1 = Character State Graph (edge weight = emotion-state change magnitude)
 
     Type-aware Q/K/V projections give each edge type its own attention space.
     """
-    def __init__(self, d_model=768, num_edge_types=3, num_heads=4):
+    def __init__(self, d_model=768, num_edge_types=2, num_heads=4):
         super().__init__()
         self.num_edge_types = num_edge_types
         self.num_heads      = num_heads
@@ -334,7 +334,7 @@ class GlobalAggregator(nn.Module):
             nn.Linear(d_model // 2, 1),
             nn.Softmax(dim=1),
         )
-        self.hgt          = HeterogeneousGraphTransformer(d_model, num_edge_types=3)
+        self.hgt          = HeterogeneousGraphTransformer(d_model, num_edge_types=2)
         self.msg_pass     = GraphMessagePassing(d_model)
         self.temporal_mamba = GraphModulatedMambaBlock(
             d_model, d_state=d_state, d_conv=4, num_layers=1
@@ -345,11 +345,10 @@ class GlobalAggregator(nn.Module):
         )
         self.norm = RMSNorm(d_model)
 
-    def forward(self, scene_embeddings_batch, causal_adj,
-                char_state_adj, discourse_adj):
+    def forward(self, scene_embeddings_batch, causal_adj, char_state_adj):
         """
         scene_embeddings_batch : [B, S, L, D]
-        *_adj                  : [B, S, S]  (three typed graphs)
+        *_adj                  : [B, S, S]  (two typed graphs)
         """
         B, S, L, D = scene_embeddings_batch.shape
 
@@ -359,13 +358,13 @@ class GlobalAggregator(nn.Module):
         pooled      = torch.bmm(weights.transpose(1, 2), flat_scenes).squeeze(1)  # [B*S, D]
         movie_seq   = pooled.view(B, S, D)                        # [B, S, D]
 
-        # HGT over three typed graphs
-        hgt_out = self.hgt(movie_seq, [causal_adj, char_state_adj, discourse_adj])
+        # HGT over two typed graphs
+        hgt_out = self.hgt(movie_seq, [causal_adj, char_state_adj])
         normed  = self.norm(hgt_out)
 
         # Bi-directional temporal Mamba
         # Use the averaged graph for the Mamba adjacency
-        avg_adj      = (causal_adj + char_state_adj + discourse_adj) / 3.0
+        avg_adj      = (causal_adj + char_state_adj) / 2.0
         fwd          = self.temporal_mamba(normed, avg_adj)
         bwd_seq      = torch.flip(normed, dims=[1])
         bwd_adj      = torch.flip(avg_adj, dims=[1, 2])
@@ -480,49 +479,62 @@ class HierarchicalPointerHeadV2(nn.Module):
 
 class NarrativeCoherenceLoss(nn.Module):
     """
-    Contrastive loss at the summary level.
+    Scene-pair contrastive loss within a single movie.
 
-    Positive pairs  = decoder hidden states for summaries whose source scenes
-                      are causally linked in causal_adj.
-    Negative pairs  = decoder hidden states for summaries of unlinked scenes.
+    Operates on encoder scene representations rather than decoder hidden states,
+    which makes the geometry match what the causal_adj describes.  Works
+    correctly at batch_size=1 — positives are scene pairs with a causal edge,
+    negatives are all other scenes in the same movie.
 
-    Pulls factually linked summary segments together, pushes unlinked apart.
-    This directly addresses the character-relationship hallucination problem
-    identified in NarrativeFactScore (EMNLP 2025).
+    Temperature 0.1 (vs the original 0.07) avoids over-sharpening with a
+    small number of scenes per movie.
     """
-    def __init__(self, temperature=0.07):
+    def __init__(self, temperature=0.1):
         super().__init__()
         self.temperature = temperature
 
-    def forward(self, decoder_hidden, causal_adj):
+    def forward(self, scene_hidden, causal_adj):
         """
-        decoder_hidden : [B, T, D]
-        causal_adj     : [B, S, S]   — we use as a proxy for which summary
-                          positions are causally related; we pool decoder
-                          hidden states and use batch-level contrastive loss.
+        scene_hidden : [B, S, L, D]  — encoder hidden states per scene
+        causal_adj   : [B, S, S]     — gated causal adjacency (float, [0,1])
         """
-        # Pool decoder states to one vector per batch item
-        pooled = decoder_hidden.mean(dim=1)            # [B, D]
-        pooled = F.normalize(pooled.float(), p=2, dim=-1)
+        B, S, L, D = scene_hidden.shape
+        # Pool each scene: [B, S, D]
+        scene_reps = scene_hidden.mean(dim=2)
+        scene_reps = F.normalize(scene_reps.float(), p=2, dim=-1)
 
-        # Batch-level similarity
-        sim = torch.matmul(pooled, pooled.T) / self.temperature  # [B, B]
+        total_loss = scene_reps.new_tensor(0.0)
+        n_valid = 0
 
-        # Positive mask: batch items that share causal edges (any edge > 0)
-        # Simple proxy: upper triangle of causal_adj summed
-        causal_sum = causal_adj.sum(dim=-1).sum(dim=-1)  # [B]
-        pos_mask   = (causal_sum > 0).float()             # [B]
-        # Outer product: both items share causal structure
-        pos_pair   = torch.outer(pos_mask, pos_mask)      # [B, B]
-        pos_pair.fill_diagonal_(0)
+        for b in range(B):
+            adj  = causal_adj[b].float()   # [S, S]
+            reps = scene_reps[b]            # [S, D]
 
-        if pos_pair.sum() == 0:
-            return sim.new_tensor(0.0)
+            # Symmetric positive mask: any directed edge in either direction
+            pos_mask = ((adj + adj.T) > 0).float()
+            pos_mask.fill_diagonal_(0)
 
-        # InfoNCE-style: for each anchor, positives are causal pairs
-        labels = pos_pair / pos_pair.sum(dim=-1, keepdim=True).clamp(min=1)
-        log_probs = F.log_softmax(sim, dim=-1)
-        return -(labels * log_probs).sum(dim=-1).mean()
+            if pos_mask.sum() == 0:
+                continue
+
+            # Scaled dot-product similarity between all scene pairs
+            sim = torch.matmul(reps, reps.T) / self.temperature  # [S, S]
+            sim.fill_diagonal_(-1e4)  # exclude self-similarity
+
+            # NT-Xent: for each anchor, positives = causally linked scenes
+            log_probs  = F.log_softmax(sim, dim=-1)       # [S, S]
+            pos_norm   = pos_mask / pos_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            loss_per_scene = -(pos_norm * log_probs).sum(dim=-1)
+
+            # Only average over scenes that have at least one positive
+            has_pos = pos_mask.sum(dim=1) > 0
+            if not has_pos.any():
+                continue
+
+            total_loss = total_loss + loss_per_scene[has_pos].mean()
+            n_valid += 1
+
+        return total_loss / max(n_valid, 1)
 
 
 # =============================================================================
@@ -601,7 +613,7 @@ class RelationalEventConsistencyLoss(nn.Module):
 
     def forward(self, log_probs, targets, triplets,
                 hidden_states=None, head_weight=None,
-                decoder_hidden=None, causal_adj=None):
+                causal_adj=None):
         device = log_probs.device
 
         # ── Entity weighting ──────────────────────────────────────────────
@@ -659,9 +671,11 @@ class RelationalEventConsistencyLoss(nn.Module):
 
         total = (1 - self.alpha) * lm_loss + self.alpha * contrastive_loss
 
-        # ── Narrative coherence loss ───────────────────────────────────────
-        if decoder_hidden is not None and causal_adj is not None:
-            coh_loss = self.coherence_loss_fn(decoder_hidden, causal_adj)
+        # ── Narrative coherence loss (scene-pair contrastive) ─────────────
+        # Uses encoder scene representations, not decoder hidden states, so
+        # the geometry aligns with what causal_adj encodes.
+        if hidden_states is not None and causal_adj is not None:
+            coh_loss = self.coherence_loss_fn(hidden_states, causal_adj)
             total    = total + self.coherence_weight * coh_loss
 
         return total
@@ -678,10 +692,26 @@ class GraMFormerV2(nn.Module):
         print(f"Loading BART backbone: {BART_MODEL}...")
         bart = BartForConditionalGeneration.from_pretrained(BART_MODEL)
 
-        self.embedding = bart.model.shared
         self.tokenizer = tokenizer
+        self.d_model   = d_model
 
-        # ── Scene-level encoder ───────────────────────────────────────────
+        # ── A1: Frozen RoBERTa scene encoder ─────────────────────────────
+        # RoBERTa provides pre-trained contextual representations (768d).
+        # It stays frozen throughout both training stages; LoRA is applied
+        # only to the Mamba layers above it.
+        print("Loading frozen RoBERTa scene encoder...")
+        self.roberta = RobertaModel.from_pretrained("roberta-base")
+        for param in self.roberta.parameters():
+            param.requires_grad = False
+
+        # A3: Linear bridge 768 → d_model (identity when d_model == 768)
+        self.scene_proj = (
+            nn.Linear(768, d_model, bias=False)
+            if d_model != 768
+            else nn.Identity()
+        )
+
+        # ── Scene-level Mamba encoder (graph-modulated SSM) ───────────────
         self.encoder = GraphModulatedMambaBlock(
             d_model=d_model, d_state=64, d_conv=4, num_layers=num_layers
         )
@@ -727,31 +757,41 @@ class GraMFormerV2(nn.Module):
     # ── Forward ────────────────────────────────────────────────────────────
 
     def forward(self, input_ids, adj, action_mask, dial_mask, ent_mask,
-                head_mask, causal_adj, char_state_adj, discourse_adj,
+                head_mask, causal_adj, char_state_adj,
                 target_ids=None, triplets=None, idf_weights=None):
         """
         input_ids       : [B, S, L]
         adj             : [B, S, L, L]   local token-level dependency graph
         *_mask          : [B, S, L]
-        causal_adj      : [B, S, S]
-        char_state_adj  : [B, S, S]
-        discourse_adj   : [B, S, S]
+        causal_adj      : [B, S, S]      directed SVO causal chains
+        char_state_adj  : [B, S, S]      emotion-state-change weighted
         target_ids      : [B, S, L]  (training only)
         triplets        : list[list[str]]
         idf_weights     : [B, S, S] optional
         """
-        B, S, L = input_ids.shape
-        d_model  = self.embedding.embedding_dim
-        chunk_sz = 10
+        B, S, L   = input_ids.shape
+        d_model   = self.d_model
+        pad_id    = 1   # shared pad_token_id for RoBERTa and BART
+        chunk_sz  = 10
         is_frozen = not next(self.encoder.parameters()).requires_grad
 
-        # ── Scene encoder (chunked for memory efficiency) ─────────────────
+        # ── Scene encoder: frozen RoBERTa → projection → Mamba ───────────
+        # RoBERTa is always run without grad (frozen throughout).
+        # Mamba encoder may be frozen (Stage 1) or LoRA-adapted (Stage 2).
         local_feats = []
         for i in range(0, S, chunk_sz):
-            j         = min(i + chunk_sz, S)
-            c_ids     = input_ids[:, i:j].contiguous().view(-1, L)
-            c_adj     = adj[:, i:j].contiguous().view(-1, L, L)
-            c_embeds  = self.embedding(c_ids)
+            j     = min(i + chunk_sz, S)
+            c_ids = input_ids[:, i:j].contiguous().view(-1, L)   # [B*chunk, L]
+            c_adj = adj[:, i:j].contiguous().view(-1, L, L)       # [B*chunk, L, L]
+
+            # A1: RoBERTa contextual encoding (frozen, always no_grad)
+            c_attn = (c_ids != pad_id).long()
+            with torch.no_grad():
+                c_roberta = self.roberta(
+                    c_ids, attention_mask=c_attn
+                ).last_hidden_state                                # [B*chunk, L, 768]
+            # A3: project 768 → d_model (identity if d_model == 768)
+            c_embeds = self.scene_proj(c_roberta)                 # [B*chunk, L, d_model]
 
             if is_frozen:
                 with torch.no_grad():
@@ -772,9 +812,9 @@ class GraMFormerV2(nn.Module):
         # Build gated causal adj (character state adj is already weighted)
         gated_causal = self.graph_modulator(local_features, causal_adj, idf_weights)
 
-        # ── Global aggregation with HGT over 3 typed graphs ──────────────
+        # ── Global aggregation with HGT over 2 typed graphs ──────────────
         enriched = self.global_aggregator(
-            local_features, gated_causal, char_state_adj, discourse_adj
+            local_features, gated_causal, char_state_adj
         )   # [B, S, L, D]
 
         # ── RAFT v2 modality fusion ───────────────────────────────────────
@@ -792,15 +832,23 @@ class GraMFormerV2(nn.Module):
         aligned_memory  = self.latent_bridge(movie_level_mem)
 
         if target_ids is not None:
-            single_target   = target_ids[:, 0, :]
-            shifted_targets = single_target[:, :-1].contiguous()
-            labels          = single_target[:, 1:].contiguous()
+            single_target = target_ids[:, 0, :]              # [B, L]
+            # C1: BART decoder must start from decoder_start_token_id=2.
+            # Extraction stores targets as [BOS=0, t1..tn, EOS=2, PAD=1...].
+            # Correct teacher-forcing:
+            #   decoder input  = [2,  t1, t2, ..., t_{L-2}]  (len L-1)
+            #   labels         = [t1, t2, ..., t_{L-1}]       (len L-1, strip BOS)
+            labels        = single_target[:, 1:].contiguous()           # strip BOS
+            dec_start     = torch.full((B, 1), 2, dtype=torch.long, device=input_ids.device)
+            shifted_targets = torch.cat(
+                [dec_start, single_target[:, 1:-1]], dim=1
+            ).contiguous()                                               # [B, L-1]
 
-            mem_pad_mask  = (input_ids[:, :, 0] == 1)
+            mem_pad_mask  = (input_ids[:, :, 0] == pad_id)
             all_masked    = mem_pad_mask.all(dim=1)
             mem_pad_mask[all_masked, 0] = False
             enc_attn_mask = (~mem_pad_mask).long()
-            tgt_attn_mask = (shifted_targets != 1).long()
+            tgt_attn_mask = (shifted_targets != pad_id).long()
 
             decoder_out   = self.bart_decoder(
                 input_ids=shifted_targets,
@@ -813,9 +861,10 @@ class GraMFormerV2(nn.Module):
 
             if triplets is not None and self.tokenizer is not None:
                 vocab_probs   = F.softmax(vocab_logits, dim=-1)
+                # C6: use lm_head weight (same BART vocab space as decoder)
                 p_gen, ptr_probs = self.pointer_head(
                     dec_hidden, movie_level_mem, triplets,
-                    self.tokenizer, self.embedding.weight, input_ids.device
+                    self.tokenizer, self.head.weight, input_ids.device
                 )
                 final_probs = p_gen * vocab_probs + (1 - p_gen) * ptr_probs
                 final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -833,7 +882,7 @@ class GraMFormerV2(nn.Module):
 # 11. Logging helpers
 # =============================================================================
 
-def log_character_attention_map(model, batch_hidden_states, causal_adj, discourse_adj):
+def log_character_attention_map(model, batch_hidden_states, causal_adj):
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m.eval()
     with torch.no_grad():

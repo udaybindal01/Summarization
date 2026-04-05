@@ -124,10 +124,15 @@ def attach_emotions(buffer, sent_tok, sent_model, device):
 # ---------------------------------------------------------------------------
 
 def process_scene(scene_text, summary, scene_id,
-                  nlp, tokenizer, max_seq_len, max_target_len):
+                  nlp, nlp_pos, tokenizer, max_seq_len, max_target_len):
     """
     Returns a pre-result dict with _char_snippets and _scene_snippet
     attached for Stage-2 sentiment scoring.
+
+    nlp     : spaCy pipeline with parser enabled (capped to _SPACY_MAX_CHARS)
+              Used for dependency-based adjacency matrix and SVO triplets.
+    nlp_pos : spaCy pipeline with parser disabled (runs on full scene text)
+              Used for entity_mask — avoids the 1000-char blind spot (F6).
     """
     # Tokenise
     encoding = tokenizer(
@@ -177,7 +182,7 @@ def process_scene(scene_text, summary, scene_id,
     dial_density = dial_count / total
     act_density  = act_count  / total
 
-    # spaCy — hard-capped to avoid O(n²) slowdown on long scenes
+    # ── spaCy (parser-enabled, capped) — adjacency matrix + SVO triplets ──
     doc        = nlp(scene_text[:_SPACY_MAX_CHARS])
     triplets   = []
     adj_matrix = [[0] * max_seq_len for _ in range(max_seq_len)]
@@ -190,12 +195,6 @@ def process_scene(scene_text, summary, scene_id,
         if 0 <= h_idx < max_seq_len and 0 <= t_idx < max_seq_len:
             adj_matrix[t_idx][h_idx] = 1
             adj_matrix[h_idx][t_idx] = 1
-
-        if token.pos_ in ["PROPN", "NOUN"] and token.is_alpha:
-            e_idx = next((idx for idx, (s, e) in enumerate(offsets)
-                          if s <= token.idx < e), -1)
-            if 0 <= e_idx < max_seq_len:
-                entity_mask[e_idx] = 1
 
         if token.dep_ == "ROOT" and token.pos_ == "VERB":
             subject = obj = None
@@ -219,6 +218,16 @@ def process_scene(scene_text, summary, scene_id,
                 for a, b in [(v_idx, s_idx), (o_idx, v_idx)]:
                     if all(0 <= x < max_seq_len for x in [a, b]):
                         adj_matrix[a][b] = 1
+
+    # ── F6: entity mask on the FULL scene text (no 1000-char cap) ──────────
+    # nlp_pos has parser disabled so it runs in linear time on any length.
+    doc_full = nlp_pos(scene_text)
+    for token in doc_full:
+        if token.pos_ in ["PROPN", "NOUN"] and token.is_alpha:
+            e_idx = next((idx for idx, (s, e) in enumerate(offsets)
+                          if s <= token.idx < e), -1)
+            if 0 <= e_idx < max_seq_len:
+                entity_mask[e_idx] = 1
 
     # Per-character snippets for Stage-2 sentiment
     sentences  = re.split(r"(?<=[.!?])\s+", scene_text)
@@ -281,11 +290,17 @@ def main():
 
     # ── Load models once ────────────────────────────────────────────────────
     print("Loading spaCy...", flush=True)
+    # Parser pipeline — capped to _SPACY_MAX_CHARS for O(n²) safety
     nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat", "lemmatizer"])
     nlp.max_length = _SPACY_MAX_CHARS + 200
+    # F6: Fast POS-only pipeline for entity mask on the FULL scene text
+    nlp_pos = spacy.load("en_core_web_sm",
+                         disable=["parser", "ner", "textcat", "lemmatizer"])
 
-    print("Loading RoBERTa tokenizer...", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained("roberta-base")
+    print("Loading BART tokenizer...", flush=True)
+    # C2: use BART tokenizer (same BPE vocab as RoBERTa, but explicit
+    # decoder_start_token_id=2 convention for BART teacher forcing).
+    tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large")
 
     print("Loading sentiment model on GPU...", flush=True)
     device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -374,7 +389,7 @@ def main():
             try:
                 pre = process_scene(
                     scene["text"], scene["summary"], scene["id"],
-                    nlp, tokenizer, max_seq_len, max_target_len,
+                    nlp, nlp_pos, tokenizer, max_seq_len, max_target_len,
                 )
                 buffer.append(pre)
             except Exception as e:

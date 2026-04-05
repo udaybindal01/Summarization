@@ -79,5 +79,7 @@ class MensaGraphDataset(Dataset):
             'dialogue_mask': get_padded_mask('dialogue_mask'),
             'entity_mask': get_padded_mask('entity_mask'),
             'header_mask': get_padded_mask('header_mask'),
-            'graph_triplets': item.get('graph_triplets', [])
+            'graph_triplets': item.get('graph_triplets', []),
+            'character_emotions': item.get('character_emotions', {}),
+            'scene_meta': item.get('scene_meta', {}),
         }
