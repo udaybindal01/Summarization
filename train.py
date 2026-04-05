@@ -112,8 +112,8 @@ EPOCHS_STAGE2      = 20   # LoRA encoder unfrozen
 LR_NEW_LAYERS      = 1e-4
 LR_LORA            = 1e-5
 
-MAX_SEQ_LEN        = 512   # must match extraction max_seq_len
-MAX_SCENES         = 200
+MAX_SEQ_LEN        = 256   # extraction used 512; we truncate here for speed
+MAX_SCENES         = 64    # 64 scenes ≫ avg movie (most MENSA films have 30-80 scenes)
 
 # =============================================================================
 # MensaGraphDataset (low-level, scene-by-scene reader)
@@ -362,10 +362,10 @@ def movie_collate_fn(batch):
                 adj_t             = torch.tensor(adj, dtype=torch.int8) if isinstance(adj, list) else adj
                 adj_t             = adj_t[:SL, :SL]
                 adj_matrix[b, s, :adj_t.size(0), :adj_t.size(1)] = adj_t
-                action_mask[b, s] = torch.tensor(sc["action_mask"][:SL],   dtype=torch.bool)
-                dial_mask[b, s]   = torch.tensor(sc["dialogue_mask"][:SL], dtype=torch.bool)
-                ent_mask[b, s]    = torch.tensor(sc["entity_mask"][:SL],   dtype=torch.bool)
-                head_mask[b, s]   = torch.tensor(sc["header_mask"][:SL],   dtype=torch.bool)
+                action_mask[b, s] = sc["action_mask"][:SL].clone()
+                dial_mask[b, s]   = sc["dialogue_mask"][:SL].clone()
+                ent_mask[b, s]    = sc["entity_mask"][:SL].clone()
+                head_mask[b, s]   = sc["header_mask"][:SL].clone()
                 all_triplets.append(sc["graph_triplets"])
             else:
                 all_triplets.append([])
@@ -540,9 +540,11 @@ def train():
 
     train_dl   = DataLoader(train_ds, batch_size=1, shuffle=True,
                             num_workers=4, pin_memory=True,
+                            persistent_workers=True,
                             collate_fn=movie_collate_fn)
     eval_dl    = DataLoader(eval_ds,  batch_size=1, shuffle=False,
                             num_workers=4, pin_memory=True,
+                            persistent_workers=True,
                             collate_fn=movie_collate_fn)
 
     # ── 3. Model ──────────────────────────────────────────────────────────────

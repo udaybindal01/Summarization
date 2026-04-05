@@ -371,11 +371,15 @@ class GlobalAggregator(nn.Module):
         bwd          = torch.flip(self.temporal_mamba(bwd_seq, bwd_adj), dims=[1])
         global_narr  = fwd + bwd                                  # [B, S, D]
 
-        # Broadcast global narrative back to token level and apply recovery gate
-        global_bc  = global_narr.unsqueeze(2).expand(-1, -1, L, -1)
-        combined   = torch.cat([scene_embeddings_batch, global_bc], dim=-1)
-        gate       = self.recovery_gate(combined)
-        enriched   = gate * scene_embeddings_batch + (1 - gate) * global_bc
+        # Recovery gate: computed per-scene (not per-token) to avoid
+        # applying Linear(2D, D) across all B×S×L positions (was the #1 bottleneck).
+        # Gate shape [B, S, 1, D] broadcasts over token dimension L.
+        global_bc    = global_narr.unsqueeze(2).expand(-1, -1, L, -1)  # [B, S, L, D]
+        pooled_local = scene_embeddings_batch.mean(dim=2)               # [B, S, D]
+        gate         = self.recovery_gate(
+            torch.cat([pooled_local, global_narr], dim=-1)              # [B, S, 2D]
+        ).unsqueeze(2)                                                   # [B, S, 1, D]
+        enriched     = gate * scene_embeddings_batch + (1 - gate) * global_bc
         return enriched   # [B, S, L, D]
 
 
@@ -772,7 +776,7 @@ class GraMFormerV2(nn.Module):
         B, S, L   = input_ids.shape
         d_model   = self.d_model
         pad_id    = 1   # shared pad_token_id for RoBERTa and BART
-        chunk_sz  = 10
+        chunk_sz  = 64   # process 64 scenes per RoBERTa call (was 10)
         is_frozen = not next(self.encoder.parameters()).requires_grad
 
         # ── Scene encoder: frozen RoBERTa → projection → Mamba ───────────
