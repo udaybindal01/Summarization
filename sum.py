@@ -776,7 +776,8 @@ class GraMFormerV2(nn.Module):
         B, S, L   = input_ids.shape
         d_model   = self.d_model
         pad_id    = 1   # shared pad_token_id for RoBERTa and BART
-        chunk_sz  = 64   # process 64 scenes per RoBERTa call (was 10)
+        chunk_sz  = 10   # Mamba scan is O(batch × seq²) — peak alloc = batch×255×2048×64×4 bytes
+                         # chunk_sz=10 → 1.3 GiB peak; chunk_sz=64 → 7.97 GiB → OOM on 44GB GPU
         is_frozen = not next(self.encoder.parameters()).requires_grad
 
         # ── Scene encoder: frozen RoBERTa → projection → Mamba ───────────
