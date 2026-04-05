@@ -220,8 +220,15 @@ class MovieGraphDatasetV2(Dataset):
         return len(self.movie_names)
 
     def __getitem__(self, idx):
-        movie_name   = self.movie_names[idx]
-        scene_indices = self.movie_map[movie_name][:self.max_scenes]
+        movie_name    = self.movie_names[idx]
+        all_indices   = self.movie_map[movie_name]
+        if len(all_indices) > self.max_scenes:
+            # Uniform stride: sample max_scenes scenes spread across the full movie
+            # so the model sees the full narrative arc (not just the opening).
+            step = len(all_indices) / self.max_scenes
+            scene_indices = [all_indices[int(i * step)] for i in range(self.max_scenes)]
+        else:
+            scene_indices = all_indices
         scenes        = [self.scene_dataset[i] for i in scene_indices]
         num_scenes    = len(scenes)
         S             = self.max_scenes
