@@ -311,12 +311,6 @@ def main():
     if device.type == "cuda":
         # bfloat16: better numerical range than float16, same speed on A100/H100
         sent_model = sent_model.to(torch.bfloat16)
-        # torch.compile fuses kernels — gives ~30% extra throughput on A100/H100
-        try:
-            sent_model = torch.compile(sent_model, mode="reduce-overhead")
-            print("  torch.compile: enabled", flush=True)
-        except Exception:
-            pass  # compile not available in this torch version — fine
     print(f"  All models loaded. Device: {device}", flush=True)
 
     # ── Build scene list ─────────────────────────────────────────────────────
