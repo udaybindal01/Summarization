@@ -97,11 +97,12 @@ ABLATION = {
 
 JSONL_PATH       = "/tmp/uday/mensa_train_data.jsonl.gz"
 MOVIESUM_PATH    = "/tmp/uday/moviesum_data.jsonl.gz"
-# Splits live on real disk (/tmp), NOT /dev/shm (RAM disk).
-# Uncompressed splits at 512-dim adj matrices = 74GB+ which fills RAM.
-# We use gzip compression — reads slightly slower but 10x smaller on disk.
-TRAIN_SPLIT_PATH = f"/tmp/uday/train_{ABLATION['run_name']}.jsonl.gz"
-EVAL_SPLIT_PATH  = f"/tmp/uday/eval_{ABLATION['run_name']}.jsonl.gz"
+# Splits are written as UNCOMPRESSED .jsonl so MensaGraphDataset can use
+# byte-offset seeking (O(1) random access, constant ~50 MB RAM regardless of
+# dataset size).  The compressed source stays as .gz — only the split copies
+# are inflated.  Expect ~55 GB train + ~10 GB eval on /tmp.
+TRAIN_SPLIT_PATH = f"/tmp/uday/train_{ABLATION['run_name']}.jsonl"
+EVAL_SPLIT_PATH  = f"/tmp/uday/eval_{ABLATION['run_name']}.jsonl"
 NUM_TRAIN_MOVIES = 700
 
 BATCH_SIZE         = 1
@@ -129,41 +130,39 @@ class MensaGraphDataset(Dataset):
 
         # Index-only pass: store byte offsets so __getitem__ can seek
         # directly to any record without loading everything into RAM.
-        # This keeps memory usage at ~50MB regardless of dataset size.
-        print(f"Indexing dataset from {jsonl_path}...")
-        self._offsets = []   # list of byte offsets for each line
-        open_fn = gzip.open if jsonl_path.endswith(".gz") else open
-
-        # For gzip we can't seek, so we store all lines in a list of
-        # (movie_id, json_string) — still much cheaper than parsed dicts.
-        # For plain files we store byte offsets for true random access.
+        # This keeps peak memory at ~50 MB regardless of dataset size.
+        # Requires an uncompressed .jsonl file (plain text, seekable).
         if jsonl_path.endswith(".gz"):
-            self._lines = []
-            with gzip.open(jsonl_path, "rt", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    # Store raw JSON string — parse lazily in __getitem__
-                    mid = json.loads(line)["movie_id"]
-                    self._lines.append(line)
-                    self.movie_ids.append(mid)
-            print(f"Indexed {len(self._lines)} scenes (lazy loading).")
-        else:
-            self._lines = []
-            with open(jsonl_path, "rt", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    mid = json.loads(line)["movie_id"]
-                    self._lines.append(line)
-                    self.movie_ids.append(mid)
-            print(f"Indexed {len(self._lines)} scenes.")
+            raise ValueError(
+                f"MensaGraphDataset requires an uncompressed .jsonl file, "
+                f"got: {jsonl_path}\n"
+                "Run split_dataset_by_movie() first — it writes uncompressed splits."
+            )
+
+        movie_id_re = re.compile(rb'"movie_id"\s*:\s*"([^"]+)"')
+        print(f"Indexing dataset from {jsonl_path}...")
+        self._offsets = []   # byte offset of each valid line
+        with open(jsonl_path, "rb") as f:
+            while True:
+                offset = f.tell()
+                line   = f.readline()
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                m = movie_id_re.search(line)
+                mid = m.group(1).decode("utf-8") if m else "unknown"
+                self._offsets.append(offset)
+                self.movie_ids.append(mid)
+        print(f"Indexed {len(self._offsets)} scenes.")
 
     def __len__(self):
-        return len(self._lines)
+        return len(self._offsets)
 
     def __getitem__(self, idx):
-        item     = json.loads(self._lines[idx])
+        with open(self.jsonl_path, "rb") as f:
+            f.seek(self._offsets[idx])
+            item = json.loads(f.readline())
         seq_len  = self.max_seq_len
 
         def _pad_or_trunc(lst, length, pad=1):

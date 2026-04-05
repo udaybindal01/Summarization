@@ -79,6 +79,8 @@ Each line in the `.jsonl.gz` files is a single scene with:
 
 Movies are grouped in the collate function (`movie_collate_fn` in `train.py`) into batches where each batch is one movie (variable number of scenes).
 
+`MensaGraphDataset` requires **uncompressed** `.jsonl` split files — it uses byte-offset seeking for O(1) random access and constant ~50 MB RAM regardless of dataset size. The source `mensa_train_data.jsonl.gz` stays compressed; `split_dataset_by_movie()` inflates it into per-split plain `.jsonl` files (expect ~55 GB train + ~10 GB eval on `/tmp`). If you see a `ValueError` about `.gz` files, delete any old `.gz` split files and re-run training.
+
 ## Key Paths (hardcoded)
 
 | Path | Purpose |
