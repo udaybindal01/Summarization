@@ -27,8 +27,10 @@ python emnlp_extractor.py --dataset moviesum --out /tmp/uday/moviesum_data.jsonl
 # Full model training
 python train.py --run_name full_model
 
-# Ablation experiments (disable individual components)
-python train.py --run_name ablation_no_causal --no_causal_graph
+# Ablation experiments (disable individual graph components)
+python train.py --run_name ablation_no_causal    --no_causal_graph
+python train.py --run_name ablation_no_charstate --no_char_state_graph
+python train.py --run_name ablation_no_cooccur   --no_char_cooccur_graph
 python train.py --run_name ablation_no_coherence --no_coherence_loss
 python train.py --run_name ablation_single_graph --single_binary_graph
 
@@ -57,8 +59,8 @@ python eval.py
 
 **GraMFormerV2** is the main model class. Key components:
 
-- **RoBERTa (frozen) → `scene_proj` → GraMambaLayer**: Scene-level encoder pipeline. Frozen `roberta-base` (768d) provides pre-trained contextual token representations. A linear bridge projects to `d_model` (identity if 768, `nn.Linear(768, 1024)` for BART-large). Mamba SSM with graph-routing then operates on these projections. LoRA (Stage 2) targets the Mamba layers: `in_proj`, `x_proj`, `out_proj`, `dt_proj`. RoBERTa stays frozen in both stages.
-- **HeterogeneousGraphTransformer (HGT)**: Fuses two typed movie-level adjacency matrices — causal event graph and character state graph — via type-aware message passing (2 heads).
+- **RoBERTa (frozen) → `scene_proj` → MambaLayer**: Scene-level encoder pipeline. Frozen `roberta-base` (768d) provides contextual token reps. `scene_proj` bridges 768→d_model (identity if d_model=768). `MambaLayer` is a clean selective SSM — no token-level graph routing (the old dependency-parse graph routing was removed: it caused O(seq²) OOM and added noise from poor spaCy accuracy on screenplay text). LoRA (Stage 2) targets: `in_proj`, `x_proj`, `out_proj`, `dt_proj`. RoBERTa stays frozen throughout.
+- **HeterogeneousGraphTransformer (HGT)**: Fuses **three** typed movie-level adjacency matrices via type-aware Q/K/V attention (3 edge types). Edge types: (0) causal event graph — directed SVO chains with entity canonicalization and stop-entity filtering; (1) character state graph — weighted by emotion-polarity delta for shared characters; (2) character co-occurrence graph — Jaccard similarity of canonical character sets per scene (built from screenplay ALL-CAPS speaker tags + SVO subjects).
 - **RaftConsensusAttentionV2**: Cross-modal attention across 4 modalities (action, dialogue, entity, header), with gated fusion and Riemannian orthogonality penalty.
 - **DynamicGraphModulator v2**: IDF-weighted edge pruning on entity co-occurrence graphs.
 - **HierarchicalPointerHead v2**: Dual-level copy mechanism (scene attention + entity salience).

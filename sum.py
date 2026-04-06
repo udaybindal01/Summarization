@@ -80,7 +80,18 @@ class RMSNorm(nn.Module):
 # 1. Scene Encoder — Graph-Modulated Mamba (unchanged from v1, stable)
 # =============================================================================
 
-class GraMambaLayer(nn.Module):
+class MambaLayer(nn.Module):
+    """
+    Selective SSM layer (Mamba-style) without token-level graph routing.
+
+    The previous GraMambaLayer injected dependency-parse adjacency into the
+    SSM scan via a O(batch × seq²) history-stack — causing 8 GB OOM on 44 GB
+    GPU and adding noisy signal (spaCy parser accuracy on screenplay text is
+    poor).  Movie-level graph structure is handled by the HGT GlobalAggregator
+    above; the scene-level SSM focuses purely on sequential token modelling.
+
+    Memory: O(batch × seq_len × d_inner) — linear in sequence length.
+    """
     def __init__(self, d_model, d_state, d_conv):
         super().__init__()
         self.norm    = nn.LayerNorm(d_model)
@@ -88,19 +99,18 @@ class GraMambaLayer(nn.Module):
         self.d_state = d_state
         self.d_inner = d_model * 2
 
-        self.in_proj             = nn.Linear(d_model, self.d_inner * 2, bias=False)
-        self.conv1d              = nn.Conv1d(self.d_inner, self.d_inner, d_conv, padding=d_conv - 1)
-        self.x_proj              = nn.Linear(self.d_inner, d_state * 2 + 1, bias=False)
-        self.dt_proj             = nn.Linear(1, self.d_inner)
-        self.graph_routing_matrix = nn.Linear(d_state, d_state)
-        self.out_proj            = nn.Linear(self.d_inner, d_model, bias=False)
+        self.in_proj  = nn.Linear(d_model, self.d_inner * 2, bias=False)
+        self.conv1d   = nn.Conv1d(self.d_inner, self.d_inner, d_conv, padding=d_conv - 1)
+        self.x_proj   = nn.Linear(self.d_inner, d_state * 2 + 1, bias=False)
+        self.dt_proj  = nn.Linear(1, self.d_inner)
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
-    def forward(self, x, adjacency_matrix):
+    def forward(self, x):
         residual = x
         x = self.norm(x)
         batch, seq_len, _ = x.shape
 
-        xz    = self.in_proj(x)
+        xz = self.in_proj(x)
         x_proj, z = xz.chunk(2, dim=-1)
         x_conv = self.conv1d(x_proj.transpose(1, 2))[..., :seq_len].transpose(1, 2)
         x_act  = F.silu(x_conv)
@@ -111,47 +121,44 @@ class GraMambaLayer(nn.Module):
         B, C  = B.float(), C.float()
         x_act_f32 = x_act.float()
 
+        # Pure SSM scan — O(seq_len) memory, no quadratic history accumulation
         h = torch.zeros(batch, self.d_inner, self.d_state,
                         device=x.device, dtype=torch.float32)
-        history_list  = []
-        scan_outputs  = []
-        adj_float = adjacency_matrix.float()  # cast once — avoids per-step dtype conversion
-
+        scan_outputs = []
         for t in range(seq_len):
-            delta_t = delta[:, t].unsqueeze(-1)
-            B_t     = B[:, t].unsqueeze(1)
-            x_t     = x_act_f32[:, t].unsqueeze(-1)
+            delta_t = delta[:, t].unsqueeze(-1)    # [batch, d_inner, 1]
+            B_t     = B[:, t].unsqueeze(1)         # [batch, 1,      d_state]
+            x_t     = x_act_f32[:, t].unsqueeze(-1) # [batch, d_inner, 1]
             h       = h * torch.exp(-delta_t) + (B_t * x_t)
+            C_t     = C[:, t].unsqueeze(1)         # [batch, 1,      d_state]
+            scan_outputs.append((h * C_t).sum(dim=-1))  # [batch, d_inner]
 
-            if t > 0:
-                causal_weights = adj_float[:, t, :t]
-                if causal_weights.any():
-                    w     = causal_weights.view(batch, t, 1, 1)
-                    hist  = torch.stack(history_list, dim=1)
-                    deg   = w.sum(dim=1).clamp(min=1.0)
-                    g_ctx = (w * hist).sum(dim=1) / deg
-                    h     = h + 0.1 * F.silu(self.graph_routing_matrix(g_ctx))
-
-            history_list.append(h)
-            C_t = C[:, t].unsqueeze(1)
-            scan_outputs.append((h * C_t).sum(dim=-1))
-
-        y = torch.stack(scan_outputs, dim=1)
+        y = torch.stack(scan_outputs, dim=1)        # [batch, seq_len, d_inner]
         return self.out_proj(y * F.silu(z)) + residual
 
 
-class GraphModulatedMambaBlock(nn.Module):
+# Keep the old name as an alias so any external references or checkpoints
+# that used GraMambaLayer still resolve.
+GraMambaLayer = MambaLayer
+
+
+class MambaBlock(nn.Module):
+    """Stack of MambaLayers — applied to scene-level token sequences."""
     def __init__(self, d_model, d_state, d_conv, num_layers=4):
         super().__init__()
         self.layers = nn.ModuleList([
-            GraMambaLayer(d_model, d_state, d_conv)
+            MambaLayer(d_model, d_state, d_conv)
             for _ in range(num_layers)
         ])
 
-    def forward(self, x, adjacency_matrix):
+    def forward(self, x):
         for layer in self.layers:
-            x = layer(x, adjacency_matrix)
+            x = layer(x)
         return x
+
+
+# Alias for checkpoint compatibility.
+GraphModulatedMambaBlock = MambaBlock
 
 
 # =============================================================================
@@ -216,13 +223,18 @@ class RaftConsensusAttentionV2(nn.Module):
 
 class HeterogeneousGraphTransformer(nn.Module):
     """
-    Fuses two typed movie-level graphs:
-      0 = Causal Event Graph  (directed SVO causal chains)
-      1 = Character State Graph (edge weight = emotion-state change magnitude)
+    Fuses N typed movie-level graphs via type-aware Q/K/V attention.
 
-    Type-aware Q/K/V projections give each edge type its own attention space.
+    Edge types (num_edge_types=3):
+      0 = Causal Event Graph     — directed SVO causal chains (entity-resolved)
+      1 = Character State Graph  — weighted by emotion-arc magnitude per character
+      2 = Character Co-occurrence — Jaccard similarity of canonical character sets
+                                    between scenes; captures who appears with whom
+
+    Type-aware Q/K/V projections give each relation type its own attention space,
+    letting the model learn which graph type is most predictive per context.
     """
-    def __init__(self, d_model=768, num_edge_types=2, num_heads=4):
+    def __init__(self, d_model=768, num_edge_types=3, num_heads=4):
         super().__init__()
         self.num_edge_types = num_edge_types
         self.num_heads      = num_heads
@@ -326,6 +338,14 @@ class GraphMessagePassing(nn.Module):
 # =============================================================================
 
 class GlobalAggregator(nn.Module):
+    """
+    Movie-level aggregation: HGT over 3 typed graphs → bi-directional Mamba
+    → per-scene recovery gate that blends local token reps with global narrative.
+
+    The 3 HGT edge types (causal, character-state, character co-occurrence)
+    each learn independent Q/K/V projections so the model can weight them
+    separately based on the training signal.
+    """
     def __init__(self, d_model=768, d_state=64):
         super().__init__()
         self.salience_pooler = nn.Sequential(
@@ -334,50 +354,45 @@ class GlobalAggregator(nn.Module):
             nn.Linear(d_model // 2, 1),
             nn.Softmax(dim=1),
         )
-        self.hgt          = HeterogeneousGraphTransformer(d_model, num_edge_types=2)
-        self.msg_pass     = GraphMessagePassing(d_model)
-        self.temporal_mamba = GraphModulatedMambaBlock(
-            d_model, d_state=d_state, d_conv=4, num_layers=1
-        )
-        self.recovery_gate = nn.Sequential(
+        # 3 typed graphs: causal, character-state, character co-occurrence
+        self.hgt            = HeterogeneousGraphTransformer(d_model, num_edge_types=3)
+        self.temporal_mamba = MambaBlock(d_model, d_state=d_state, d_conv=4, num_layers=1)
+        self.recovery_gate  = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.Sigmoid(),
         )
         self.norm = RMSNorm(d_model)
 
-    def forward(self, scene_embeddings_batch, causal_adj, char_state_adj):
+    def forward(self, scene_embeddings_batch, causal_adj, char_state_adj, char_cooccur_adj):
         """
         scene_embeddings_batch : [B, S, L, D]
-        *_adj                  : [B, S, S]  (two typed graphs)
+        causal_adj             : [B, S, S]   directed SVO causal chains
+        char_state_adj         : [B, S, S]   emotion-arc weighted
+        char_cooccur_adj       : [B, S, S]   Jaccard character co-occurrence
         """
         B, S, L, D = scene_embeddings_batch.shape
 
-        # Salience pool each scene to a single vector
+        # Salience pool each scene to a single vector: [B*S, L, D] → [B, S, D]
         flat_scenes = scene_embeddings_batch.view(B * S, L, D)
         weights     = self.salience_pooler(flat_scenes)           # [B*S, L, 1]
-        pooled      = torch.bmm(weights.transpose(1, 2), flat_scenes).squeeze(1)  # [B*S, D]
+        pooled      = torch.bmm(weights.transpose(1, 2), flat_scenes).squeeze(1)
         movie_seq   = pooled.view(B, S, D)                        # [B, S, D]
 
-        # HGT over two typed graphs
-        hgt_out = self.hgt(movie_seq, [causal_adj, char_state_adj])
+        # HGT over 3 typed graphs
+        hgt_out = self.hgt(movie_seq, [causal_adj, char_state_adj, char_cooccur_adj])
         normed  = self.norm(hgt_out)
 
-        # Bi-directional temporal Mamba
-        # Use the averaged graph for the Mamba adjacency
-        avg_adj      = (causal_adj + char_state_adj) / 2.0
-        fwd          = self.temporal_mamba(normed, avg_adj)
-        bwd_seq      = torch.flip(normed, dims=[1])
-        bwd_adj      = torch.flip(avg_adj, dims=[1, 2])
-        bwd          = torch.flip(self.temporal_mamba(bwd_seq, bwd_adj), dims=[1])
-        global_narr  = fwd + bwd                                  # [B, S, D]
+        # Bi-directional temporal Mamba (pure SSM, no adjacency routing)
+        fwd         = self.temporal_mamba(normed)
+        bwd         = torch.flip(self.temporal_mamba(torch.flip(normed, dims=[1])), dims=[1])
+        global_narr = fwd + bwd                                   # [B, S, D]
 
-        # Recovery gate: computed per-scene (not per-token) to avoid
-        # applying Linear(2D, D) across all B×S×L positions (was the #1 bottleneck).
-        # Gate shape [B, S, 1, D] broadcasts over token dimension L.
+        # Recovery gate: per-scene, broadcast over L (prevents the O(B×S×L)
+        # linear bottleneck from the previous per-token gate).
         global_bc    = global_narr.unsqueeze(2).expand(-1, -1, L, -1)  # [B, S, L, D]
         pooled_local = scene_embeddings_batch.mean(dim=2)               # [B, S, D]
         gate         = self.recovery_gate(
-            torch.cat([pooled_local, global_narr], dim=-1)              # [B, S, 2D]
+            torch.cat([pooled_local, global_narr], dim=-1)
         ).unsqueeze(2)                                                   # [B, S, 1, D]
         enriched     = gate * scene_embeddings_batch + (1 - gate) * global_bc
         return enriched   # [B, S, L, D]
@@ -760,36 +775,34 @@ class GraMFormerV2(nn.Module):
 
     # ── Forward ────────────────────────────────────────────────────────────
 
-    def forward(self, input_ids, adj, action_mask, dial_mask, ent_mask,
-                head_mask, causal_adj, char_state_adj,
+    def forward(self, input_ids, action_mask, dial_mask, ent_mask,
+                head_mask, causal_adj, char_state_adj, char_cooccur_adj,
                 target_ids=None, triplets=None, idf_weights=None):
         """
-        input_ids       : [B, S, L]
-        adj             : [B, S, L, L]   local token-level dependency graph
-        *_mask          : [B, S, L]
-        causal_adj      : [B, S, S]      directed SVO causal chains
-        char_state_adj  : [B, S, S]      emotion-state-change weighted
-        target_ids      : [B, S, L]  (training only)
-        triplets        : list[list[str]]
-        idf_weights     : [B, S, S] optional
+        input_ids        : [B, S, L]
+        *_mask           : [B, S, L]
+        causal_adj       : [B, S, S]   directed SVO causal chains (entity-resolved)
+        char_state_adj   : [B, S, S]   emotion-arc weighted
+        char_cooccur_adj : [B, S, S]   Jaccard character co-occurrence
+        target_ids       : [B, S, L]   (training only)
+        triplets         : list[list[str]]
+        idf_weights      : [B, S, S]   optional
         """
         B, S, L   = input_ids.shape
         d_model   = self.d_model
         pad_id    = 1   # shared pad_token_id for RoBERTa and BART
-        chunk_sz  = 10   # Mamba scan is O(batch × seq²) — peak alloc = batch×255×2048×64×4 bytes
-                         # chunk_sz=10 → 1.3 GiB peak; chunk_sz=64 → 7.97 GiB → OOM on 44GB GPU
+        # MambaLayer is now O(seq_len) memory (no quadratic history accumulation),
+        # so chunk_sz=32 is safe even on 44 GB GPU with 64 scenes × 256 tokens.
+        chunk_sz  = 32
         is_frozen = not next(self.encoder.parameters()).requires_grad
 
         # ── Scene encoder: frozen RoBERTa → projection → Mamba ───────────
-        # RoBERTa is always run without grad (frozen throughout).
-        # Mamba encoder may be frozen (Stage 1) or LoRA-adapted (Stage 2).
         local_feats = []
         for i in range(0, S, chunk_sz):
             j     = min(i + chunk_sz, S)
             c_ids = input_ids[:, i:j].contiguous().view(-1, L)   # [B*chunk, L]
-            c_adj = adj[:, i:j].contiguous().view(-1, L, L)       # [B*chunk, L, L]
 
-            # A1: RoBERTa contextual encoding (frozen, always no_grad)
+            # A1: RoBERTa contextual encoding (always frozen, always no_grad)
             c_attn = (c_ids != pad_id).long()
             with torch.no_grad():
                 c_roberta = self.roberta(
@@ -800,26 +813,22 @@ class GraMFormerV2(nn.Module):
 
             if is_frozen:
                 with torch.no_grad():
-                    c_out = self.encoder(c_embeds, c_adj)
+                    c_out = self.encoder(c_embeds)
             elif self.use_checkpointing:
-                c_out = checkpoint(
-                    lambda x, a: self.encoder(x, a),
-                    c_embeds, c_adj, use_reentrant=False
-                )
+                c_out = checkpoint(self.encoder, c_embeds, use_reentrant=False)
             else:
-                c_out = self.encoder(c_embeds, c_adj)
+                c_out = self.encoder(c_embeds)
             local_feats.append(c_out)
 
-        local_flat    = torch.cat(local_feats, dim=0)             # [B*S, L, D]
+        local_flat     = torch.cat(local_feats, dim=0)            # [B*S, L, D]
         local_features = local_flat.view(B, S, L, d_model)        # [B, S, L, D]
 
-        # ── Dynamic graph modulation ──────────────────────────────────────
-        # Build gated causal adj (character state adj is already weighted)
+        # ── Dynamic graph modulation (IDF-gated causal adj) ───────────────
         gated_causal = self.graph_modulator(local_features, causal_adj, idf_weights)
 
-        # ── Global aggregation with HGT over 2 typed graphs ──────────────
+        # ── Global aggregation: HGT (3 graphs) + bi-Mamba + recovery gate ─
         enriched = self.global_aggregator(
-            local_features, gated_causal, char_state_adj
+            local_features, gated_causal, char_state_adj, char_cooccur_adj
         )   # [B, S, L, D]
 
         # ── RAFT v2 modality fusion ───────────────────────────────────────

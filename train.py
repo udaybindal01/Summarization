@@ -61,9 +61,10 @@ _parser.add_argument("--bart_model", type=str,
 _parser.add_argument("--bart_tokenizer", type=str, default="",
                      help="Explicit tokenizer path/name (defaults to bart_model)")
 _parser.add_argument("--d_model",            type=int,   default=1024)
-_parser.add_argument("--no_causal_graph",    action="store_true")
-_parser.add_argument("--no_char_state_graph",action="store_true")
-_parser.add_argument("--no_coherence_loss",  action="store_true")
+_parser.add_argument("--no_causal_graph",      action="store_true")
+_parser.add_argument("--no_char_state_graph",  action="store_true")
+_parser.add_argument("--no_char_cooccur_graph",action="store_true")
+_parser.add_argument("--no_coherence_loss",    action="store_true")
 _parser.add_argument("--no_contrastive_loss",action="store_true")
 _parser.add_argument("--no_pointer_head",    action="store_true")
 _parser.add_argument("--use_raft_v1",        action="store_true")
@@ -83,8 +84,9 @@ ABLATION = {
     "bart_model":          _args.bart_model,
     "bart_tokenizer":      _BART_TOKENIZER,
     "d_model":             _args.d_model,
-    "use_causal_graph":    not _args.no_causal_graph,
-    "use_char_state_graph":not _args.no_char_state_graph,
+    "use_causal_graph":       not _args.no_causal_graph,
+    "use_char_state_graph":   not _args.no_char_state_graph,
+    "use_char_cooccur_graph": not _args.no_char_cooccur_graph,
 
     "use_coherence_loss":  not _args.no_coherence_loss,
     "use_contrastive_loss":not _args.no_contrastive_loss,
@@ -183,17 +185,17 @@ class MensaGraphDataset(Dataset):
             adj_t = pad_adj
 
         return {
-            "input_ids":        torch.tensor(_pad_or_trunc(item["input_ids"],  seq_len), dtype=torch.long),
-            "target_ids":       torch.tensor(_pad_or_trunc(item["target_ids"], seq_len), dtype=torch.long),
-            "adjacency_matrix": adj_t,
-            "action_mask":      _to_bool_tensor(item["action_mask"]),
-            "dialogue_mask":    _to_bool_tensor(item["dialogue_mask"]),
-            "entity_mask":      _to_bool_tensor(item.get("entity_mask", [0] * seq_len)),
-            "header_mask":      _to_bool_tensor(item.get("header_mask", [0] * seq_len)),
-            "graph_triplets":   item.get("graph_triplets", []),
+            "input_ids":          torch.tensor(_pad_or_trunc(item["input_ids"],  seq_len), dtype=torch.long),
+            "target_ids":         torch.tensor(_pad_or_trunc(item["target_ids"], seq_len), dtype=torch.long),
+            "action_mask":        _to_bool_tensor(item["action_mask"]),
+            "dialogue_mask":      _to_bool_tensor(item["dialogue_mask"]),
+            "entity_mask":        _to_bool_tensor(item.get("entity_mask", [0] * seq_len)),
+            "header_mask":        _to_bool_tensor(item.get("header_mask", [0] * seq_len)),
+            "graph_triplets":     item.get("graph_triplets", []),
             "character_emotions": item.get("character_emotions", {}),
-            "scene_meta":       item.get("scene_meta", {}),
-            "movie_id":         item["movie_id"],
+            "characters":         item.get("characters", []),   # speaker names from extractor
+            "scene_meta":         item.get("scene_meta", {}),
+            "movie_id":           item["movie_id"],
         }
 
 
@@ -234,77 +236,124 @@ class MovieGraphDatasetV2(Dataset):
         S             = self.max_scenes
 
         if movie_name in self.adj_cache:
-            causal_adj, char_state_adj, idf_weights = self.adj_cache[movie_name]
+            causal_adj, char_state_adj, char_cooccur_adj, idf_weights = \
+                self.adj_cache[movie_name]
             return {
-                "movie_name":     movie_name,
-                "scenes":         scenes,
-                "causal_adj":     causal_adj,
-                "char_state_adj": char_state_adj,
-                "idf_weights":    idf_weights,
+                "movie_name":      movie_name,
+                "scenes":          scenes,
+                "causal_adj":      causal_adj,
+                "char_state_adj":  char_state_adj,
+                "char_cooccur_adj": char_cooccur_adj,
+                "idf_weights":     idf_weights,
             }
 
+        # ── Entity canonicalization (applied to all 3 graphs) ───────────────
+        # Filter out single-char tokens, pure stopwords, and numeric strings
+        # so that common words ("a", "it", "man") don't create spurious edges.
+        _STOP_ENTITIES = frozenset({
+            "man", "woman", "him", "her", "he", "she", "they", "them",
+            "it", "one", "two", "other", "others", "that", "this",
+        })
+
+        def _canonical_entities(triplet_list, field):
+            """Return lowercase canonical entity set from SVO triplets."""
+            ents = set()
+            for t in triplet_list:
+                parts = t.split("_")
+                if field == "subj" and len(parts) >= 1:
+                    raw = parts[0].replace("NOT ", "").strip().lower()
+                elif field == "obj" and len(parts) >= 3:
+                    raw = parts[2].strip().lower()
+                else:
+                    continue
+                if raw and raw.isalpha() and len(raw) > 1 and raw not in _STOP_ENTITIES:
+                    ents.add(raw)
+            return ents
+
+        def _scene_chars(scene):
+            """All canonical character names for a scene (speaker tags + SVO subjects)."""
+            chars = set()
+            # Priority 1: speaker names from screenplay format (extractor field)
+            for c in scene.get("characters", []):
+                key = c.strip().lower()
+                if key and key.isalpha() and len(key) > 1:
+                    chars.add(key)
+            # Priority 2: SVO subjects (broader but noisier)
+            chars |= _canonical_entities(scene.get("graph_triplets", []), "subj")
+            return chars
+
+        # Pre-compute per-scene entity sets (used in all 3 graph constructions)
+        scene_subj_sets = [
+            _canonical_entities(scenes[i].get("graph_triplets", []), "subj")
+            for i in range(num_scenes)
+        ]
+        scene_obj_sets = [
+            _canonical_entities(scenes[i].get("graph_triplets", []), "obj")
+            for i in range(num_scenes)
+        ]
+        scene_char_sets = [_scene_chars(scenes[i]) for i in range(num_scenes)]
+
         # ── Graph 1: Causal Event Graph ─────────────────────────────────────
-        # Directed edge i→j if obj(i) matches subj(j) (causal chain)
+        # Directed edge i→j: a canonical object entity of scene i is a subject
+        # entity of scene j (entity-resolved causal chain).
+        # Backward edge weighted 0.3 (provides context without reversing direction).
         causal_adj = torch.zeros(S, S)
-        causal_adj.fill_diagonal_(1.0)   # self-loop
+        causal_adj.fill_diagonal_(1.0)
 
         for i in range(num_scenes):
-            trips_i = scenes[i]["graph_triplets"]
-            objs_i  = set()
-            for t in trips_i:
-                parts = t.split("_")
-                if len(parts) >= 3:
-                    objs_i.add(parts[2].strip().lower())
-            objs_i.discard("")
-
+            objs_i = scene_obj_sets[i]
+            if not objs_i:
+                continue
             for j in range(i + 1, num_scenes):
-                trips_j  = scenes[j]["graph_triplets"]
-                subjs_j  = set()
-                for t in trips_j:
-                    parts = t.split("_")
-                    if len(parts) >= 1:
-                        subjs_j.add(parts[0].replace("NOT ", "").strip().lower())
-                subjs_j.discard("")
-
-                if objs_i & subjs_j:            # causal chain: obj(i)→subj(j)
-                    causal_adj[i, j] = 1.0      # directed forward
-                    causal_adj[j, i] = 0.3      # weak backward (context)
+                subjs_j = scene_subj_sets[j]
+                if objs_i & subjs_j:
+                    causal_adj[i, j] = 1.0   # directed forward
+                    causal_adj[j, i] = 0.3   # weak backward (context)
 
         # ── Graph 2: Character State Graph ──────────────────────────────────
-        # Edge weight = magnitude of emotion-polarity change between appearances
+        # Edge weight = mean absolute emotion-polarity change for shared characters.
+        # Uses canonical character keys to improve cross-scene matching.
         char_state_adj = torch.zeros(S, S)
         char_state_adj.fill_diagonal_(1.0)
 
-        # Collect all emotion dicts
         emotions = [scenes[i]["character_emotions"] for i in range(num_scenes)]
         for i in range(num_scenes):
             for j in range(i + 1, num_scenes):
-                shared_chars = set(emotions[i].keys()) & set(emotions[j].keys())
-                if not shared_chars:
+                shared = set(emotions[i].keys()) & set(emotions[j].keys())
+                if not shared:
                     continue
-                # Edge weight = mean absolute state change across shared characters
-                changes = [
-                    abs(emotions[i][c] - emotions[j][c])
-                    for c in shared_chars
-                ]
-                weight = sum(changes) / len(changes)
+                changes = [abs(emotions[i][c] - emotions[j][c]) for c in shared]
+                weight  = sum(changes) / len(changes)
                 char_state_adj[i, j] = weight
                 char_state_adj[j, i] = weight
 
-        # ── IDF weights over entity co-occurrences ──────────────────────────
-        # idf(entity) = log(N / df) where df = #scenes containing entity
-        all_entities = defaultdict(int)
-        scene_entity_sets = []
+        # ── Graph 3: Character Co-occurrence Graph ───────────────────────────
+        # Edge weight = Jaccard similarity of canonical character sets.
+        # Captures which scenes share the same characters — a strong signal for
+        # narrative continuity that neither causal nor emotion graphs capture.
+        char_cooccur_adj = torch.zeros(S, S)
+        char_cooccur_adj.fill_diagonal_(1.0)
+
         for i in range(num_scenes):
-            ents = set()
-            for t in scenes[i]["graph_triplets"]:
-                parts = t.split("_")
-                if len(parts) >= 1:
-                    ents.add(parts[0].replace("NOT ", "").strip().lower())
-                if len(parts) >= 3:
-                    ents.add(parts[2].strip().lower())
-            ents.discard("")
-            scene_entity_sets.append(ents)
+            chars_i = scene_char_sets[i]
+            if not chars_i:
+                continue
+            for j in range(i + 1, num_scenes):
+                chars_j = scene_char_sets[j]
+                union   = chars_i | chars_j
+                if not union:
+                    continue
+                jaccard = len(chars_i & chars_j) / len(union)
+                if jaccard > 0:
+                    char_cooccur_adj[i, j] = jaccard
+                    char_cooccur_adj[j, i] = jaccard
+
+        # ── IDF weights over entity co-occurrences ──────────────────────────
+        all_entities   = defaultdict(int)
+        scene_ent_sets = []
+        for i in range(num_scenes):
+            ents = scene_subj_sets[i] | scene_obj_sets[i]
+            scene_ent_sets.append(ents)
             for e in ents:
                 all_entities[e] += 1
 
@@ -312,23 +361,22 @@ class MovieGraphDatasetV2(Dataset):
         N = max(num_scenes, 1)
         for i in range(num_scenes):
             for j in range(i + 1, num_scenes):
-                shared = scene_entity_sets[i] & scene_entity_sets[j]
+                shared = scene_ent_sets[i] & scene_ent_sets[j]
                 if shared:
-                    # Average IDF of shared entities (rare = high IDF = high weight)
                     avg_idf = sum(
-                        math.log(N / max(all_entities[e], 1))
-                        for e in shared
+                        math.log(N / max(all_entities[e], 1)) for e in shared
                     ) / len(shared)
                     idf_weights[i, j] = avg_idf
                     idf_weights[j, i] = avg_idf
 
-        self.adj_cache[movie_name] = (causal_adj, char_state_adj, idf_weights)
+        self.adj_cache[movie_name] = (causal_adj, char_state_adj, char_cooccur_adj, idf_weights)
         return {
-            "movie_name":     movie_name,
-            "scenes":         scenes,
-            "causal_adj":     causal_adj,
-            "char_state_adj": char_state_adj,
-            "idf_weights":    idf_weights,
+            "movie_name":       movie_name,
+            "scenes":           scenes,
+            "causal_adj":       causal_adj,
+            "char_state_adj":   char_state_adj,
+            "char_cooccur_adj": char_cooccur_adj,
+            "idf_weights":      idf_weights,
         }
 
 
@@ -341,17 +389,17 @@ def movie_collate_fn(batch):
     seq_len    = len(batch[0]["scenes"][0]["input_ids"])
     B          = len(batch)
 
-    input_ids    = torch.full((B, max_scenes, seq_len), 1, dtype=torch.long)
-    target_ids   = torch.full((B, max_scenes, seq_len), 1, dtype=torch.long)
-    adj_matrix   = torch.zeros((B, max_scenes, seq_len, seq_len), dtype=torch.int8)
-    action_mask  = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
-    dial_mask    = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
-    ent_mask     = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
-    head_mask    = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
+    input_ids  = torch.full((B, max_scenes, seq_len), 1, dtype=torch.long)
+    target_ids = torch.full((B, max_scenes, seq_len), 1, dtype=torch.long)
+    action_mask = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
+    dial_mask   = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
+    ent_mask    = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
+    head_mask   = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
 
-    causal_adj_b     = torch.zeros((B, max_scenes, max_scenes))
-    char_state_adj_b = torch.zeros((B, max_scenes, max_scenes))
-    idf_weights_b    = torch.zeros((B, max_scenes, max_scenes))
+    causal_adj_b      = torch.zeros((B, max_scenes, max_scenes))
+    char_state_adj_b  = torch.zeros((B, max_scenes, max_scenes))
+    char_cooccur_adj_b = torch.zeros((B, max_scenes, max_scenes))
+    idf_weights_b     = torch.zeros((B, max_scenes, max_scenes))
 
     all_triplets = []
 
@@ -360,39 +408,34 @@ def movie_collate_fn(batch):
         for s in range(max_scenes):
             if s < ns:
                 sc = item["scenes"][s]
-                # Defensive truncation: handles seq_len mismatches between
-                # extraction (512) and any future config changes
                 SL = seq_len
-                input_ids[b, s]   = sc["input_ids"][:SL]
-                target_ids[b, s]  = sc["target_ids"][:SL]
-                adj               = sc["adjacency_matrix"]
-                adj_t             = torch.tensor(adj, dtype=torch.int8) if isinstance(adj, list) else adj
-                adj_t             = adj_t[:SL, :SL]
-                adj_matrix[b, s, :adj_t.size(0), :adj_t.size(1)] = adj_t
-                action_mask[b, s] = sc["action_mask"][:SL].clone()
-                dial_mask[b, s]   = sc["dialogue_mask"][:SL].clone()
-                ent_mask[b, s]    = sc["entity_mask"][:SL].clone()
-                head_mask[b, s]   = sc["header_mask"][:SL].clone()
+                input_ids[b, s]    = sc["input_ids"][:SL]
+                target_ids[b, s]   = sc["target_ids"][:SL]
+                action_mask[b, s]  = sc["action_mask"][:SL].clone()
+                dial_mask[b, s]    = sc["dialogue_mask"][:SL].clone()
+                ent_mask[b, s]     = sc["entity_mask"][:SL].clone()
+                head_mask[b, s]    = sc["header_mask"][:SL].clone()
                 all_triplets.append(sc["graph_triplets"])
             else:
                 all_triplets.append([])
 
-        causal_adj_b[b, :ns, :ns]     = item["causal_adj"][:ns, :ns]
-        char_state_adj_b[b, :ns, :ns] = item["char_state_adj"][:ns, :ns]
-        idf_weights_b[b, :ns, :ns]    = item["idf_weights"][:ns, :ns]
+        causal_adj_b[b, :ns, :ns]       = item["causal_adj"][:ns, :ns]
+        char_state_adj_b[b, :ns, :ns]   = item["char_state_adj"][:ns, :ns]
+        char_cooccur_adj_b[b, :ns, :ns] = item["char_cooccur_adj"][:ns, :ns]
+        idf_weights_b[b, :ns, :ns]      = item["idf_weights"][:ns, :ns]
 
     return {
-        "input_ids":      input_ids,
-        "target_ids":     target_ids,
-        "adj_matrix":     adj_matrix,
-        "action_mask":    action_mask,
-        "dial_mask":      dial_mask,
-        "ent_mask":       ent_mask,
-        "head_mask":      head_mask,
-        "causal_adj":     causal_adj_b,
-        "char_state_adj": char_state_adj_b,
-        "idf_weights":    idf_weights_b,
-        "triplets":       all_triplets,
+        "input_ids":        input_ids,
+        "target_ids":       target_ids,
+        "action_mask":      action_mask,
+        "dial_mask":        dial_mask,
+        "ent_mask":         ent_mask,
+        "head_mask":        head_mask,
+        "causal_adj":       causal_adj_b,
+        "char_state_adj":   char_state_adj_b,
+        "char_cooccur_adj": char_cooccur_adj_b,
+        "idf_weights":      idf_weights_b,
+        "triplets":         all_triplets,
     }
 
 
@@ -738,33 +781,34 @@ def train():
 
         bar = tqdm(train_dl, desc=f"E{epoch + 1} Train", unit="batch")
         for batch_idx, batch in enumerate(bar):
-            inp     = batch["input_ids"].to(device)
-            adj_m   = batch["adj_matrix"].to(device)
-            a_mask  = batch["action_mask"].to(device)
-            d_mask  = batch["dial_mask"].to(device)
-            e_mask  = batch["ent_mask"].to(device)
-            h_mask  = batch["head_mask"].to(device)
-            c_adj   = batch["causal_adj"].to(device)
-            cs_adj  = batch["char_state_adj"].to(device)
-            idf_w   = batch["idf_weights"].to(device)
-            tgt     = batch["target_ids"].to(device)
-            trips   = batch["triplets"]
+            inp    = batch["input_ids"].to(device)
+            a_mask = batch["action_mask"].to(device)
+            d_mask = batch["dial_mask"].to(device)
+            e_mask = batch["ent_mask"].to(device)
+            h_mask = batch["head_mask"].to(device)
+            c_adj  = batch["causal_adj"].to(device)
+            cs_adj = batch["char_state_adj"].to(device)
+            cc_adj = batch["char_cooccur_adj"].to(device)
+            idf_w  = batch["idf_weights"].to(device)
+            tgt    = batch["target_ids"].to(device)
+            trips  = batch["triplets"]
 
             # Zero out graphs disabled by ablation flags
             if not ABLATION["use_causal_graph"]:
                 c_adj  = torch.zeros_like(c_adj)
             if not ABLATION["use_char_state_graph"]:
                 cs_adj = torch.zeros_like(cs_adj)
+            if not ABLATION["use_char_cooccur_graph"]:
+                cc_adj = torch.zeros_like(cc_adj)
             if ABLATION["single_binary_graph"]:
-                # Collapse both graphs to a single binary co-occurrence adj
-                # (v1 baseline — tests whether typed graphs help over binary)
-                binary = ((c_adj + cs_adj) > 0).float()
-                c_adj = cs_adj = binary
+                # Collapse all 3 graphs to one binary adj (v1 baseline)
+                binary = ((c_adj + cs_adj + cc_adj) > 0).float()
+                c_adj = cs_adj = cc_adj = binary
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits, enc_mem, labels, _, gated_causal = model(
-                    inp, adj_m, a_mask, d_mask, e_mask, h_mask,
-                    c_adj, cs_adj, tgt, trips, idf_w
+                    inp, a_mask, d_mask, e_mask, h_mask,
+                    c_adj, cs_adj, cc_adj, tgt, trips, idf_w
                 )
                 logits = logits.float()
                 loss   = criterion(
@@ -819,13 +863,13 @@ def train():
         with torch.no_grad():
             for batch_idx, batch in enumerate(bar_e):
                 inp    = batch["input_ids"].to(device)
-                adj_m  = batch["adj_matrix"].to(device)
                 a_mask = batch["action_mask"].to(device)
                 d_mask = batch["dial_mask"].to(device)
                 e_mask = batch["ent_mask"].to(device)
                 h_mask = batch["head_mask"].to(device)
                 c_adj  = batch["causal_adj"].to(device)
                 cs_adj = batch["char_state_adj"].to(device)
+                cc_adj = batch["char_cooccur_adj"].to(device)
                 idf_w  = batch["idf_weights"].to(device)
                 tgt    = batch["target_ids"].to(device)
                 trips  = batch["triplets"]
@@ -834,14 +878,16 @@ def train():
                     c_adj  = torch.zeros_like(c_adj)
                 if not ABLATION["use_char_state_graph"]:
                     cs_adj = torch.zeros_like(cs_adj)
+                if not ABLATION["use_char_cooccur_graph"]:
+                    cc_adj = torch.zeros_like(cc_adj)
                 if ABLATION["single_binary_graph"]:
-                    binary = ((c_adj + cs_adj) > 0).float()
-                    c_adj = cs_adj = binary
+                    binary = ((c_adj + cs_adj + cc_adj) > 0).float()
+                    c_adj = cs_adj = cc_adj = binary
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits, enc_mem, labels, _, gated_causal = model(
-                        inp, adj_m, a_mask, d_mask, e_mask, h_mask,
-                        c_adj, cs_adj, tgt, trips, idf_w
+                        inp, a_mask, d_mask, e_mask, h_mask,
+                        c_adj, cs_adj, cc_adj, tgt, trips, idf_w
                     )
                     logits  = logits.float()
                     e_loss  = criterion(
@@ -850,7 +896,6 @@ def train():
                         triplets=trips,
                         hidden_states=enc_mem,
                         head_weight=model.head.weight,
-    
                         causal_adj=gated_causal,
                     )
 
@@ -860,8 +905,8 @@ def train():
                 # ── Beam-search generation (every 10th batch) ────────────────
                 if batch_idx % 10 == 0:
                     aligned_mem, _ = model(
-                        inp, adj_m, a_mask, d_mask, e_mask, h_mask,
-                        c_adj, cs_adj,
+                        inp, a_mask, d_mask, e_mask, h_mask,
+                        c_adj, cs_adj, cc_adj,
                         target_ids=None, triplets=None, idf_weights=idf_w,
                     )
                     mem_pad_mask  = (inp[:, :, 0] == 1)

@@ -24,7 +24,6 @@ import torch
 import re
 import gzip
 import os
-import sys
 import warnings
 import argparse
 from tqdm import tqdm
@@ -49,8 +48,59 @@ hf_logging.set_verbosity_error()
 _SENTIMENT_MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 _SENT_MAX_CHARS  = 256    # chars per snippet fed to sentiment model
 _SENT_BATCH_SIZE = 2048   # 40GB VRAM — saturate the GPU fully
-_SPACY_MAX_CHARS = 1000   # hard cap on spaCy input — prevents O(n²) slowdown
+_SPACY_MAX_CHARS = 1000   # hard cap on spaCy parser input — prevents O(n²) slowdown
 _WRITE_EVERY     = 512    # flush every N scenes — matches large batch size
+
+# ---------------------------------------------------------------------------
+# Screenplay character extraction
+# ---------------------------------------------------------------------------
+# Words that appear as standalone ALL-CAPS lines but are NOT character names.
+_SCENE_HEADER_WORDS = frozenset({
+    "INT", "EXT", "INT.", "EXT.", "INTERIOR", "EXTERIOR",
+    "CUT", "FADE", "DISSOLVE", "SMASH", "MATCH", "WIPE",
+    "CONTINUED", "CONTINUE", "CONTINUING", "END", "TITLE", "TITLES",
+    "BACK", "LATER", "CONTINUOUS", "MOMENTS", "SIMULTANEOUSLY",
+    "DAY", "NIGHT", "MORNING", "EVENING", "DUSK", "DAWN",
+    "THE", "A", "AN", "AND", "OR",
+})
+
+_CHAR_NAME_RE = re.compile(r'^[A-Z][A-Z\s\'\.\-]{1,39}$')
+
+
+def extract_scene_speakers(scene_text):
+    """
+    Extract speaking character names from screenplay formatting convention.
+
+    Screenplay format: a character name appears on its own line in ALL CAPS
+    (optionally followed by a parenthetical stage direction) immediately before
+    their dialogue.  Examples: "ELENA", "JOHN (V.O.)", "MR. SMITH".
+
+    Returns a deduplicated list of canonical character name strings.
+    """
+    speakers = set()
+    for line in scene_text.split('\n'):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Strip parenthetical stage directions: "JOHN (V.O.)" → "JOHN"
+        cleaned = re.sub(r'\s*\([^)]*\)', '', stripped).strip()
+        if not cleaned:
+            continue
+        # Must be: all uppercase letters/spaces/apostrophes/periods/hyphens,
+        # 2–40 characters, 1–4 words, at least one purely alphabetic word.
+        if (len(cleaned) < 2 or len(cleaned) > 40
+                or cleaned != cleaned.upper()
+                or not _CHAR_NAME_RE.match(cleaned)):
+            continue
+        words = cleaned.split()
+        if len(words) > 4:
+            continue
+        if any(w in _SCENE_HEADER_WORDS for w in words):
+            continue
+        if not any(w.isalpha() for w in words):
+            continue
+        speakers.add(cleaned)
+    return sorted(speakers)   # sorted for determinism
 
 
 # ---------------------------------------------------------------------------
@@ -182,20 +232,15 @@ def process_scene(scene_text, summary, scene_id,
     dial_density = dial_count / total
     act_density  = act_count  / total
 
-    # ── spaCy (parser-enabled, capped) — adjacency matrix + SVO triplets ──
-    doc        = nlp(scene_text[:_SPACY_MAX_CHARS])
-    triplets   = []
-    adj_matrix = [[0] * max_seq_len for _ in range(max_seq_len)]
+    # ── spaCy (parser-enabled, capped to 1000 chars) — SVO triplets only ──
+    # Adjacency matrix removed: it was 99.6% sparse (dependency tree has ~L
+    # edges in L² entries), noisy on screenplay text, and caused O(seq²) OOM
+    # in the Mamba scan.  Movie-level graph structure is captured by the three
+    # typed scene-level adjacency matrices built in MovieGraphDatasetV2.
+    doc      = nlp(scene_text[:_SPACY_MAX_CHARS])
+    triplets = []
 
     for token in doc:
-        h_idx = next((idx for idx, (s, e) in enumerate(offsets)
-                      if s <= token.head.idx < e), -1)
-        t_idx = next((idx for idx, (s, e) in enumerate(offsets)
-                      if s <= token.idx < e), -1)
-        if 0 <= h_idx < max_seq_len and 0 <= t_idx < max_seq_len:
-            adj_matrix[t_idx][h_idx] = 1
-            adj_matrix[h_idx][t_idx] = 1
-
         if token.dep_ == "ROOT" and token.pos_ == "VERB":
             subject = obj = None
             negation = any(c.dep_ == "neg" for c in token.children)
@@ -209,15 +254,6 @@ def process_scene(scene_text, summary, scene_id,
                 triplets.append(
                     f"{prefix}{subject.text}_{token.text}_{obj.text}"
                 )
-                s_idx = next((idx for idx, (s, e) in enumerate(offsets)
-                              if s <= subject.idx < e), -1)
-                v_idx = next((idx for idx, (s, e) in enumerate(offsets)
-                              if s <= token.idx < e), -1)
-                o_idx = next((idx for idx, (s, e) in enumerate(offsets)
-                              if s <= obj.idx < e), -1)
-                for a, b in [(v_idx, s_idx), (o_idx, v_idx)]:
-                    if all(0 <= x < max_seq_len for x in [a, b]):
-                        adj_matrix[a][b] = 1
 
     # ── F6: entity mask on the FULL scene text (no 1000-char cap) ──────────
     # nlp_pos has parser disabled so it runs in linear time on any length.
@@ -251,23 +287,26 @@ def process_scene(scene_text, summary, scene_id,
         )[:_SENT_MAX_CHARS]
 
     return {
-        "movie_id":         scene_id,
-        "input_ids":        input_ids,
-        "target_ids":       target_ids,
-        "adjacency_matrix": adj_matrix,
-        "action_mask":      action_mask,
-        "dialogue_mask":    dialogue_mask,
-        "entity_mask":      entity_mask,
-        "header_mask":      header_mask,
-        "graph_triplets":   triplets,
+        "movie_id":       scene_id,
+        "input_ids":      input_ids,
+        "target_ids":     target_ids,
+        "action_mask":    action_mask,
+        "dialogue_mask":  dialogue_mask,
+        "entity_mask":    entity_mask,
+        "header_mask":    header_mask,
+        "graph_triplets": triplets,
+        # Canonical speaking character names (ALL-CAPS screenplay convention).
+        # Used in MovieGraphDatasetV2 for the character co-occurrence graph —
+        # higher quality than SVO subjects for identifying who is in the scene.
+        "characters":     extract_scene_speakers(scene_text),
         "scene_meta": {
             "dialogue_density": round(dial_density, 4),
             "action_density":   round(act_density,  4),
             "has_int":          has_int,
             "has_ext":          has_ext,
         },
-        "_char_snippets":   char_snippets,
-        "_scene_snippet":   scene_text[:_SENT_MAX_CHARS],
+        "_char_snippets":  char_snippets,
+        "_scene_snippet":  scene_text[:_SENT_MAX_CHARS],
     }
 
 
