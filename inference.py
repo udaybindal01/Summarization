@@ -159,7 +159,40 @@ def build_idf_weights(scenes, max_scenes):
                 ) / len(shared)
                 idf_weights[i, j] = avg_idf
                 idf_weights[j, i] = avg_idf
-    return idf_weights
+    return idf_weights, scene_ent_sets, all_entities
+
+
+_MAX_ENTITIES = 50   # must match train.py MAX_ENTITIES
+
+
+def build_entity_graphs(scenes, max_scenes, scene_ent_sets, all_entities):
+    """
+    Build entity_presence [max_scenes, E] and entity_entity_adj [E, E]
+    for the Dynamic Knowledge Graph, mirroring MovieGraphDatasetV2 exactly.
+    """
+    num_scenes = len(scenes)
+    E = _MAX_ENTITIES
+
+    # Global entity registry: top-E by frequency
+    ent_freq = sorted(all_entities.items(), key=lambda x: -x[1])
+    entity_registry = [e for e, _ in ent_freq[:E]]
+    ent_to_idx = {e: i for i, e in enumerate(entity_registry)}
+
+    entity_presence = torch.zeros((max_scenes, E))
+    for s in range(num_scenes):
+        for ent in scene_ent_sets[s]:
+            if ent in ent_to_idx:
+                entity_presence[s, ent_to_idx[ent]] = 1.0
+
+    entity_entity_adj = torch.zeros((E, E))
+    for s in range(num_scenes):
+        present = [ent_to_idx[e] for e in scene_ent_sets[s] if e in ent_to_idx]
+        for i in range(len(present)):
+            for j in range(i + 1, len(present)):
+                entity_entity_adj[present[i], present[j]] += 1.0
+                entity_entity_adj[present[j], present[i]] += 1.0
+
+    return entity_presence, entity_entity_adj
 
 
 # =============================================================================
@@ -181,12 +214,15 @@ def generate_summary(model, tokenizer, batch, device,
     b_cs_adj    = batch["char_state_adj"].to(device)
     b_cc_adj    = batch["char_cooccur_adj"].to(device)
     b_idf_w     = batch["idf_weights"].to(device)
+    b_ent_pres  = batch["entity_presence"].to(device)   # [1, S, E]
+    b_ent_adj   = batch["entity_entity_adj"].to(device) # [1, E, E]
 
     # Encode once — returns aligned_memory [1, S, D]
     aligned_memory, _ = model(
         b_input_ids, b_act_mask, b_dial_mask, b_ent_mask, b_head_mask,
         b_causal, b_cs_adj, b_cc_adj,
         target_ids=None, triplets=None, idf_weights=b_idf_w,
+        entity_presence=b_ent_pres, entity_entity_adj=b_ent_adj,
     )
 
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 1
@@ -324,15 +360,20 @@ def main():
     causal_adj       = build_causal_graph(movie_scenes,     MAX_SCENES)
     char_state_adj   = build_char_state_graph(movie_scenes, MAX_SCENES)
     char_cooccur_adj = build_char_cooccur_graph(movie_scenes, MAX_SCENES)
-    idf_weights      = build_idf_weights(movie_scenes,      MAX_SCENES)
+    idf_weights, scene_ent_sets, all_entities = build_idf_weights(movie_scenes, MAX_SCENES)
+    entity_presence, entity_entity_adj = build_entity_graphs(
+        movie_scenes, MAX_SCENES, scene_ent_sets, all_entities
+    )
 
     mock_item = {
-        "movie_name":       target_movie_name,
-        "scenes":           movie_scenes,
-        "causal_adj":       causal_adj,
-        "char_state_adj":   char_state_adj,
-        "char_cooccur_adj": char_cooccur_adj,
-        "idf_weights":      idf_weights,
+        "movie_name":        target_movie_name,
+        "scenes":            movie_scenes,
+        "causal_adj":        causal_adj,
+        "char_state_adj":    char_state_adj,
+        "char_cooccur_adj":  char_cooccur_adj,
+        "idf_weights":       idf_weights,
+        "entity_presence":   entity_presence,    # [MAX_SCENES, E]
+        "entity_entity_adj": entity_entity_adj,  # [E, E]
     }
 
     batch = movie_collate_fn([mock_item])

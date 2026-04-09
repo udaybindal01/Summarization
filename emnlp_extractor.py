@@ -1,21 +1,25 @@
 """
-emnlp_extractor.py  —  GraM-Former v2 Data Pipeline
-=====================================================
+emnlp_extractor.py  —  Dual-Tower Hypergraph Data Pipeline
+===========================================================
 Architecture: single-process pipeline with batched GPU sentiment.
 
-We intentionally avoid multiprocessing here. The previous design hit two
-hard walls:
-  1. spaCy + tokenizer init across N worker processes = N×30s startup delay
-     before a single result appears.
-  2. Large screenplay scenes make spaCy's O(n²) parser slow regardless.
+Changes from GraMFormer v2:
+  - Added NER extraction per scene  (for hypergraph node construction)
+  - Added hyperedge type classification per scene  (CONFLICT/ALLIANCE/DECEPTION/DIALOGUE/NEUTRAL)
+  - Removed adjacency_matrix output  (replaced by dynamic hypergraph built at training time)
+  - Both input_ids and target_ids use BART tokenizer throughout
 
-This version processes scenes sequentially on CPU (spaCy + tokenizer are
-fast once loaded once), batches sentiment inference on GPU, and writes
-results incrementally.  With a single load of both models and GPU-batched
-sentiment, throughput is ~500-1500 scenes/min on a typical research server.
-
-To go faster: run multiple instances of this script on disjoint slices of
-the dataset using --start and --end arguments (see bottom of file).
+Output per scene (saved to .jsonl.gz):
+  input_ids, target_ids            — BART-tokenized, padded to max_seq_len
+  action_mask, dialogue_mask,
+  entity_mask, header_mask         — 4-way modality masks [max_seq_len]
+  graph_triplets                   — ["subj_verb_obj", ...]  (SVO from ROOT-verb parse)
+  characters                       — ALL-CAPS speaker names from screenplay format
+  ner_entities                     — [{"text": "joker", "type": "PERSON"}, ...]  ← NEW
+  hyperedge_type                   — "CONFLICT" | "ALLIANCE" | "DECEPTION" |     ← NEW
+                                     "DIALOGUE" | "NEUTRAL"
+  character_emotions               — {"joker": 0.72, ...}  (Cardiff sentiment)
+  scene_meta                       — {dialogue_density, action_density, has_int, has_ext}
 """
 
 import json
@@ -46,15 +50,69 @@ hf_logging.set_verbosity_error()
 # Config
 # ---------------------------------------------------------------------------
 _SENTIMENT_MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
-_SENT_MAX_CHARS  = 256    # chars per snippet fed to sentiment model
-_SENT_BATCH_SIZE = 2048   # 40GB VRAM — saturate the GPU fully
-_SPACY_MAX_CHARS = 1000   # hard cap on spaCy parser input — prevents O(n²) slowdown
-_WRITE_EVERY     = 512    # flush every N scenes — matches large batch size
+_SENT_MAX_CHARS  = 256
+_SENT_BATCH_SIZE = 2048
+_SPACY_MAX_CHARS = 1000   # cap for O(n²) parser — SVO triplets only
+_WRITE_EVERY     = 512
+
+# ---------------------------------------------------------------------------
+# Hyperedge type classification
+# ---------------------------------------------------------------------------
+# Maps ROOT verb lemmas to narrative relation types.
+# These 5 types become the typed hyperedges in DynamicHypergraphTower.
+_VERB_CLASS_MAP = {
+    "CONFLICT":  {
+        "shoot", "kill", "attack", "fight", "hit", "stab", "threaten",
+        "destroy", "bomb", "punch", "chase", "arrest", "hurt", "wound",
+        "fire", "explode", "detonate", "crash", "beat",
+    },
+    "ALLIANCE":  {
+        "help", "save", "join", "protect", "trust", "support", "rescue",
+        "defend", "assist", "give", "share", "carry", "guard", "follow",
+        "lead", "bring", "take", "hold",
+    },
+    "DECEPTION": {
+        "lie", "betray", "trick", "deceive", "manipulate", "hide", "deny",
+        "pretend", "steal", "escape", "flee", "run", "avoid", "cover",
+        "conceal", "plant",
+    },
+    "DIALOGUE":  {
+        "tell", "ask", "say", "warn", "explain", "speak", "answer",
+        "reveal", "shout", "whisper", "call", "meet", "discuss", "argue",
+        "offer", "order", "inform", "question", "admit", "confess",
+    },
+}
+
+# NER types kept for the hypergraph node registry.
+# Only these types produce nodes — others are too noisy.
+_KEPT_ENTITY_TYPES = frozenset({"PERSON", "ORG", "GPE", "FACILITY", "PRODUCT"})
+
+
+def _classify_hyperedge_type(triplets):
+    """
+    Classify a scene's dominant narrative action type from its SVO triplets.
+
+    Returns one of: "CONFLICT", "ALLIANCE", "DECEPTION", "DIALOGUE", "NEUTRAL"
+    """
+    counts = {k: 0 for k in _VERB_CLASS_MAP}
+    for trip in triplets:
+        parts = trip.split("_")
+        if len(parts) < 2:
+            continue
+        verb = parts[1].lower().strip()
+        for rtype, verb_set in _VERB_CLASS_MAP.items():
+            if verb in verb_set:
+                counts[rtype] += 1
+                break
+    total = sum(counts.values())
+    if total == 0:
+        return "NEUTRAL"
+    return max(counts, key=counts.get)
+
 
 # ---------------------------------------------------------------------------
 # Screenplay character extraction
 # ---------------------------------------------------------------------------
-# Words that appear as standalone ALL-CAPS lines but are NOT character names.
 _SCENE_HEADER_WORDS = frozenset({
     "INT", "EXT", "INT.", "EXT.", "INTERIOR", "EXTERIOR",
     "CUT", "FADE", "DISSOLVE", "SMASH", "MATCH", "WIPE",
@@ -63,31 +121,22 @@ _SCENE_HEADER_WORDS = frozenset({
     "DAY", "NIGHT", "MORNING", "EVENING", "DUSK", "DAWN",
     "THE", "A", "AN", "AND", "OR",
 })
-
 _CHAR_NAME_RE = re.compile(r'^[A-Z][A-Z\s\'\.\-]{1,39}$')
 
 
 def extract_scene_speakers(scene_text):
     """
-    Extract speaking character names from screenplay formatting convention.
-
-    Screenplay format: a character name appears on its own line in ALL CAPS
-    (optionally followed by a parenthetical stage direction) immediately before
-    their dialogue.  Examples: "ELENA", "JOHN (V.O.)", "MR. SMITH".
-
-    Returns a deduplicated list of canonical character name strings.
+    Extract speaking character names from ALL-CAPS screenplay format lines.
+    Returns a sorted deduplicated list of canonical name strings.
     """
     speakers = set()
     for line in scene_text.split('\n'):
         stripped = line.strip()
         if not stripped:
             continue
-        # Strip parenthetical stage directions: "JOHN (V.O.)" → "JOHN"
         cleaned = re.sub(r'\s*\([^)]*\)', '', stripped).strip()
         if not cleaned:
             continue
-        # Must be: all uppercase letters/spaces/apostrophes/periods/hyphens,
-        # 2–40 characters, 1–4 words, at least one purely alphabetic word.
         if (len(cleaned) < 2 or len(cleaned) > 40
                 or cleaned != cleaned.upper()
                 or not _CHAR_NAME_RE.match(cleaned)):
@@ -100,7 +149,7 @@ def extract_scene_speakers(scene_text):
         if not any(w.isalpha() for w in words):
             continue
         speakers.add(cleaned)
-    return sorted(speakers)   # sorted for determinism
+    return sorted(speakers)
 
 
 # ---------------------------------------------------------------------------
@@ -117,21 +166,18 @@ def score_snippets(snippets, sent_tok, sent_model, device):
     ).to(device)
     with torch.no_grad():
         logits = sent_model(**enc).logits
-    probs    = torch.softmax(logits.float(), dim=-1)   # [B, 3]  neg/neu/pos
+    probs    = torch.softmax(logits.float(), dim=-1)   # [B, 3] neg/neu/pos
     polarity = (probs[:, 2] - probs[:, 0]).cpu().tolist()
     return polarity
 
 
 def attach_emotions(buffer, sent_tok, sent_model, device):
     """
-    Given a list of pre-processed scene dicts (with _char_snippets and
-    _scene_snippet fields), run batched GPU sentiment and attach
-    character_emotions.  Strips temp fields before returning.
+    Batch GPU sentiment scoring. Attaches character_emotions to each record.
+    Strips temporary _char_snippets / _scene_snippet fields before returning.
     """
-    # Flatten all snippets from all scenes into one list
-    index    = []   # (buf_idx, char_key_or_"__scene__")
+    index    = []
     snippets = []
-
     for i, rec in enumerate(buffer):
         index.append((i, "__scene__"))
         snippets.append(rec["_scene_snippet"])
@@ -139,7 +185,6 @@ def attach_emotions(buffer, sent_tok, sent_model, device):
             index.append((i, char_key))
             snippets.append(snip)
 
-    # Sub-batch to stay within VRAM
     scores = []
     for start in range(0, len(snippets), _SENT_BATCH_SIZE):
         scores.extend(score_snippets(
@@ -147,7 +192,6 @@ def attach_emotions(buffer, sent_tok, sent_model, device):
             sent_tok, sent_model, device,
         ))
 
-    # Distribute back
     scene_pol = {}
     char_pol  = {}
     for (buf_idx, key), score in zip(index, scores):
@@ -170,21 +214,18 @@ def attach_emotions(buffer, sent_tok, sent_model, device):
 
 
 # ---------------------------------------------------------------------------
-# Single-scene CPU processing (called inline — no multiprocessing)
+# Single-scene CPU processing
 # ---------------------------------------------------------------------------
 
 def process_scene(scene_text, summary, scene_id,
-                  nlp, nlp_pos, tokenizer, max_seq_len, max_target_len):
+                  nlp, nlp_ner_pos, tokenizer, max_seq_len, max_target_len):
     """
-    Returns a pre-result dict with _char_snippets and _scene_snippet
-    attached for Stage-2 sentiment scoring.
+    Returns a pre-result dict with sentiment temp fields attached.
 
-    nlp     : spaCy pipeline with parser enabled (capped to _SPACY_MAX_CHARS)
-              Used for dependency-based adjacency matrix and SVO triplets.
-    nlp_pos : spaCy pipeline with parser disabled (runs on full scene text)
-              Used for entity_mask — avoids the 1000-char blind spot (F6).
+    nlp         : spaCy with parser, capped to _SPACY_MAX_CHARS — SVO triplets
+    nlp_ner_pos : spaCy with NER + POS, parser disabled — full text NER + entity_mask
     """
-    # Tokenise
+    # ── Tokenise ─────────────────────────────────────────────────────────────
     encoding = tokenizer(
         scene_text, max_length=max_seq_len, truncation=True,
         return_offsets_mapping=True, padding="max_length",
@@ -197,7 +238,7 @@ def process_scene(scene_text, summary, scene_id,
     target_ids = target_enc["input_ids"]
     offsets    = encoding["offset_mapping"]
 
-    # 4-way modality masks
+    # ── 4-way modality masks ─────────────────────────────────────────────────
     action_mask   = [0] * max_seq_len
     dialogue_mask = [0] * max_seq_len
     entity_mask   = [0] * max_seq_len
@@ -232,11 +273,7 @@ def process_scene(scene_text, summary, scene_id,
     dial_density = dial_count / total
     act_density  = act_count  / total
 
-    # ── spaCy (parser-enabled, capped to 1000 chars) — SVO triplets only ──
-    # Adjacency matrix removed: it was 99.6% sparse (dependency tree has ~L
-    # edges in L² entries), noisy on screenplay text, and caused O(seq²) OOM
-    # in the Mamba scan.  Movie-level graph structure is captured by the three
-    # typed scene-level adjacency matrices built in MovieGraphDatasetV2.
+    # ── SVO triplets (parser-enabled, capped to 1000 chars) ──────────────────
     doc      = nlp(scene_text[:_SPACY_MAX_CHARS])
     triplets = []
 
@@ -251,21 +288,45 @@ def process_scene(scene_text, summary, scene_id,
                     obj = child
             if subject and obj:
                 prefix = "NOT " if negation else ""
-                triplets.append(
-                    f"{prefix}{subject.text}_{token.text}_{obj.text}"
-                )
+                triplets.append(f"{prefix}{subject.text}_{token.text}_{obj.text}")
 
-    # ── F6: entity mask on the FULL scene text (no 1000-char cap) ──────────
-    # nlp_pos has parser disabled so it runs in linear time on any length.
-    doc_full = nlp_pos(scene_text)
+    # ── NER + entity_mask on FULL scene text ─────────────────────────────────
+    # nlp_ner_pos has parser disabled → linear time on any length.
+    doc_full    = nlp_ner_pos(scene_text)
+    ner_entities = []
+    seen_ner     = set()
+
+    for ent in doc_full.ents:
+        if ent.label_ not in _KEPT_ENTITY_TYPES:
+            continue
+        normalized = ent.text.strip().lower()
+        if not normalized or len(normalized) < 2:
+            continue
+        # Entity mask — mark token positions in the tokenized sequence
+        e_idx = next((idx for idx, (s, e) in enumerate(offsets)
+                      if s <= ent.start_char < e and s != e), -1)
+        if 0 <= e_idx < max_seq_len:
+            entity_mask[e_idx] = 1
+        # NER registry entry (unique per scene)
+        if normalized not in seen_ner:
+            ner_entities.append({
+                "text": normalized,
+                "type": ent.label_,
+            })
+            seen_ner.add(normalized)
+
+    # Fallback entity_mask: PROPN / NOUN tokens not caught by NER
     for token in doc_full:
         if token.pos_ in ["PROPN", "NOUN"] and token.is_alpha:
             e_idx = next((idx for idx, (s, e) in enumerate(offsets)
-                          if s <= token.idx < e), -1)
+                          if s <= token.idx < e and s != e), -1)
             if 0 <= e_idx < max_seq_len:
                 entity_mask[e_idx] = 1
 
-    # Per-character snippets for Stage-2 sentiment
+    # ── Hyperedge type classification ─────────────────────────────────────────
+    hyperedge_type = _classify_hyperedge_type(triplets)
+
+    # ── Per-character sentiment snippets ─────────────────────────────────────
     sentences  = re.split(r"(?<=[.!?])\s+", scene_text)
     char_names = {}
     for trip in triplets:
@@ -287,18 +348,19 @@ def process_scene(scene_text, summary, scene_id,
         )[:_SENT_MAX_CHARS]
 
     return {
-        "movie_id":       scene_id,
-        "input_ids":      input_ids,
-        "target_ids":     target_ids,
-        "action_mask":    action_mask,
-        "dialogue_mask":  dialogue_mask,
-        "entity_mask":    entity_mask,
-        "header_mask":    header_mask,
-        "graph_triplets": triplets,
-        # Canonical speaking character names (ALL-CAPS screenplay convention).
-        # Used in MovieGraphDatasetV2 for the character co-occurrence graph —
-        # higher quality than SVO subjects for identifying who is in the scene.
-        "characters":     extract_scene_speakers(scene_text),
+        "movie_id":        scene_id,
+        "input_ids":       input_ids,
+        "target_ids":      target_ids,
+        "action_mask":     action_mask,
+        "dialogue_mask":   dialogue_mask,
+        "entity_mask":     entity_mask,
+        "header_mask":     header_mask,
+        "graph_triplets":  triplets,
+        "characters":      extract_scene_speakers(scene_text),
+        # ── New fields for dynamic hypergraph ──────────────────────────────
+        "ner_entities":    ner_entities,      # [{text, type}, ...]
+        "hyperedge_type":  hyperedge_type,    # dominant action type string
+        # ──────────────────────────────────────────────────────────────────
         "scene_meta": {
             "dialogue_density": round(dial_density, 4),
             "action_density":   round(act_density,  4),
@@ -319,26 +381,25 @@ def main():
     parser.add_argument("--start",   type=int, default=0)
     parser.add_argument("--end",     type=int, default=-1)
     parser.add_argument("--out",     type=str,
-                        default="/tmp/uday/mensa_train_data.jsonl.gz")
-    parser.add_argument("--dataset", type=str, default="mensa",
+                        default="/tmp/uday/moviesum_data.jsonl.gz")
+    parser.add_argument("--dataset", type=str, default="moviesum",
                         choices=["mensa", "moviesum"],
-                        help="Which dataset to extract from")
+                        help="MovieSum is the primary dataset for this architecture")
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
-    # ── Load models once ────────────────────────────────────────────────────
-    print("Loading spaCy...", flush=True)
-    # Parser pipeline — capped to _SPACY_MAX_CHARS for O(n²) safety
+    # ── Load models once ─────────────────────────────────────────────────────
+    print("Loading spaCy (parser pipeline, capped)...", flush=True)
     nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat", "lemmatizer"])
     nlp.max_length = _SPACY_MAX_CHARS + 200
-    # F6: Fast POS-only pipeline for entity mask on the FULL scene text
-    nlp_pos = spacy.load("en_core_web_sm",
-                         disable=["parser", "ner", "textcat", "lemmatizer"])
+
+    print("Loading spaCy (NER + POS pipeline, full text)...", flush=True)
+    # This pipeline runs on full scene text — NER enabled, parser disabled
+    nlp_ner_pos = spacy.load("en_core_web_sm",
+                             disable=["parser", "textcat", "lemmatizer"])
 
     print("Loading BART tokenizer...", flush=True)
-    # C2: use BART tokenizer (same BPE vocab as RoBERTa, but explicit
-    # decoder_start_token_id=2 convention for BART teacher forcing).
     tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large")
 
     print("Loading sentiment model on GPU...", flush=True)
@@ -348,16 +409,14 @@ def main():
         _SENTIMENT_MODEL
     ).to(device).eval()
     if device.type == "cuda":
-        # bfloat16: better numerical range than float16, same speed on A100/H100
         sent_model = sent_model.to(torch.bfloat16)
     print(f"  All models loaded. Device: {device}", flush=True)
 
-    # ── Build scene list ─────────────────────────────────────────────────────
+    # ── Build scene list ──────────────────────────────────────────────────────
     max_seq_len    = 512
     max_target_len = 512
     all_scenes     = []
 
-    # ── Dataset loading — supports MENSA and MovieSum ──────────────────────
     if args.dataset == "mensa":
         print("Downloading MENSA dataset...", flush=True)
         dataset = load_dataset("rohitsaxena/MENSA", split="train")
@@ -375,13 +434,9 @@ def main():
                         })
 
     elif args.dataset == "moviesum":
-        # MovieSum: Saxena & Keller 2024 — same format as MENSA
-        # HuggingFace: rohitsaxena/MovieSum  (same author, same schema)
         print("Downloading MovieSum dataset...", flush=True)
         dataset = load_dataset("rohitsaxena/MovieSum", split="train")
         for ex in tqdm(dataset, desc="Building scene list (MovieSum)"):
-            # MovieSum uses 'screenplay' field for scene text list
-            # and 'summary' for the Wikipedia plot summary
             scenes_list  = ex.get("screenplay", ex.get("scenes", []))
             summary_text = ex.get("summary", "")
             movie_id     = ex.get("name", ex.get("title", "movie"))
@@ -394,11 +449,7 @@ def main():
                             "id":      f"{movie_id}_Scene_{i:03d}",
                         })
             elif isinstance(scenes_list, str) and len(scenes_list.strip()) > 10:
-                # Some MovieSum entries have a single string screenplay
-                # Split into pseudo-scenes on scene header patterns
-                raw_scenes = re.split(
-                    r"(?=(?:INT[.]|EXT[.])[ \t])", scenes_list
-                )
+                raw_scenes = re.split(r"(?=(?:INT[.]|EXT[.])[ \t])", scenes_list)
                 for i, scene_txt in enumerate(raw_scenes):
                     if len(scene_txt.strip()) > 10:
                         all_scenes.append({
@@ -407,13 +458,11 @@ def main():
                             "id":      f"{movie_id}_Scene_{i:03d}",
                         })
 
-    # Apply sharding slice
     end       = args.end if args.end > 0 else len(all_scenes)
     all_scenes = all_scenes[args.start:end]
-    print(f"Processing {len(all_scenes):,} scenes "
-          f"(indices {args.start}–{end})", flush=True)
+    print(f"Processing {len(all_scenes):,} scenes (indices {args.start}–{end})",
+          flush=True)
 
-    # ── Single-process extraction with GPU-batched sentiment ─────────────────
     written = 0
     buffer  = []
 
@@ -422,11 +471,11 @@ def main():
             try:
                 pre = process_scene(
                     scene["text"], scene["summary"], scene["id"],
-                    nlp, nlp_pos, tokenizer, max_seq_len, max_target_len,
+                    nlp, nlp_ner_pos, tokenizer, max_seq_len, max_target_len,
                 )
                 buffer.append(pre)
-            except Exception as e:
-                continue   # skip broken scenes silently
+            except Exception:
+                continue
 
             if len(buffer) >= _WRITE_EVERY:
                 for rec in attach_emotions(buffer, sent_tok, sent_model, device):
@@ -435,7 +484,6 @@ def main():
                 buffer = []
                 out_f.flush()
 
-        # Flush remainder
         if buffer:
             for rec in attach_emotions(buffer, sent_tok, sent_model, device):
                 out_f.write(json.dumps(rec) + "\n")

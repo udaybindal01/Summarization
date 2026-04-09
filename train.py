@@ -1,17 +1,23 @@
 """
-train.py  —  GraM-Former v2 Training Pipeline
-==============================================
-Key changes over v1
--------------------
-  - MovieGraphDatasetV2  builds TWO typed adjacency matrices per movie:
-      causal_adj       (directed SVO causal chains)
-      char_state_adj   (weighted by emotion-state-change magnitude)
-  - IDF weights computed per-movie over entity co-occurrences
-  - Separate learning-rate groups (encoder LoRA vs new layers)
-  - Label-smoothing loss + graduated entity penalty (α_entity schedule)
-  - Beam search evaluation loop (beam=4, no_repeat_ngram_size=3)
-  - ROUGE-1/2/L computed every epoch via huggingface evaluate
-  - Narrative coherence loss wired in from sum.py
+train.py  —  Dual-Tower Dynamic Hypergraph Training Pipeline
+=============================================================
+Key differences from GraMFormer v2
+------------------------------------
+  - Primary dataset: MovieSum (1,800 movies vs MENSA's 500)
+  - MovieHypergraphDataset replaces MovieGraphDatasetV2:
+      builds incidence_matrix [N, S] and edge/entity type tensors per movie
+      instead of three [S,S] static adjacency matrices
+  - hypergraph_collate_fn replaces movie_collate_fn
+  - Model: DualTowerHypergraphSummariser replaces GraMFormerV2
+  - Loss: incidence_matrix passed instead of causal_adj for coherence loss
+  - Ablation flags updated: --no_hypergraph, --static_hypergraph,
+    --no_raft, --no_pointer_head, --no_coherence_loss, --no_contrastive_loss
+  - Evaluation: ROUGE + BERTScore + METEOR + entity F1 (all 4 every epoch)
+  - Cross-dataset: evaluate MovieSum-trained model on MENSA zero-shot
+
+Paper baseline to implement separately:
+  DiscoGraMS ported to screenplay domain (static pairwise graph + dual-tower)
+  Run: python train.py --run_name discograms_baseline --static_hypergraph --no_gru
 """
 
 import torch
@@ -27,7 +33,8 @@ from collections import defaultdict
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup, BartForConditionalGeneration
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+import torch.nn.functional as F
 import torch.nn.utils as nn_utils
 import torch._dynamo
 
@@ -37,113 +44,121 @@ os.environ["TMPDIR"]    = "/tmp/uday"
 sys.path.insert(0, "/tmp/uday/lib")
 
 from peft import LoraConfig, get_peft_model
+
 import sum as _sum_module
 from sum import (
-    GraMFormerV2,
+    DualTowerHypergraphSummariser,
     RelationalEventConsistencyLoss,
     RaftConsensusAttentionV2,
-    log_character_attention_map,
-    log_character_attention_map_labeled,
+    log_hyperedge_attention,
+    log_entity_state_norms,
+    HYPEREDGE_TYPE_MAP,
+    ENTITY_TYPE_MAP,
+    MAX_ENTITIES,
+    NUM_HYPEREDGE_TYPES,
+    NUM_ENTITY_TYPES,
 )
 
 torch.set_float32_matmul_precision("high")
 
 # =============================================================================
-# Config
+# Argument parsing + ablation config
 # =============================================================================
 import argparse as _ap
-_parser = _ap.ArgumentParser(add_help=False)
-_parser.add_argument("--run_name",           type=str,   default="full_model")
-_parser.add_argument("--bart_model", type=str,
-                     default=("/tmp/uday/bart-large"
-                              if __import__("os").path.isdir("/tmp/uday/bart-large")
-                              else "facebook/bart-large"))
-_parser.add_argument("--bart_tokenizer", type=str, default="",
-                     help="Explicit tokenizer path/name (defaults to bart_model)")
-_parser.add_argument("--d_model",            type=int,   default=1024)
-_parser.add_argument("--no_causal_graph",      action="store_true")
-_parser.add_argument("--no_char_state_graph",  action="store_true")
-_parser.add_argument("--no_char_cooccur_graph",action="store_true")
-_parser.add_argument("--no_coherence_loss",    action="store_true")
-_parser.add_argument("--no_contrastive_loss",action="store_true")
-_parser.add_argument("--no_pointer_head",    action="store_true")
-_parser.add_argument("--use_raft_v1",        action="store_true")
-_parser.add_argument("--single_binary_graph",action="store_true")
-_parser.add_argument("--entity_penalty",     type=float, default=3.0)
-_parser.add_argument("--dataset",            type=str,   default="mensa",
-                     choices=["mensa", "moviesum", "both"])
-_args, _ = _parser.parse_known_args()
+_p = _ap.ArgumentParser(add_help=False)
+_p.add_argument("--run_name",           type=str,   default="full_model")
+_p.add_argument("--bart_model",         type=str,
+                default=("/tmp/uday/bart-large"
+                         if os.path.isdir("/tmp/uday/bart-large")
+                         else "facebook/bart-large"))
+_p.add_argument("--bart_tokenizer",     type=str,   default="")
+_p.add_argument("--d_model",            type=int,   default=1024)
+_p.add_argument("--num_layers",         type=int,   default=4)
+# Ablation flags
+_p.add_argument("--no_hypergraph",      action="store_true",
+                help="Disable hypergraph tower entirely (text-only baseline)")
+_p.add_argument("--static_hypergraph",  action="store_true",
+                help="Freeze entity states after scene 0 (DiscoGraMS-style baseline)")
+_p.add_argument("--no_gru",             action="store_true",
+                help="Replace GRU update with simple EMA (α=0.7)")
+_p.add_argument("--no_raft",            action="store_true",
+                help="Disable RAFT cross-modal fusion in text tower")
+_p.add_argument("--no_pointer_head",    action="store_true")
+_p.add_argument("--no_coherence_loss",  action="store_true")
+_p.add_argument("--no_contrastive_loss",action="store_true")
+_p.add_argument("--entity_penalty",     type=float, default=3.0)
+_p.add_argument("--dataset",            type=str,   default="moviesum",
+                choices=["moviesum", "mensa", "both"])
+_args, _ = _p.parse_known_args()
 
-# Ablation flags — each flag disables one component for ablation experiments.
-# Run with e.g.:  python train.py --run_name ablation_no_causal --no_causal_graph
-# C2: explicit BART tokenizer — falls back to bart_model path
 _BART_TOKENIZER = _args.bart_tokenizer or _args.bart_model
 
 ABLATION = {
-    "run_name":            _args.run_name,
-    "bart_model":          _args.bart_model,
-    "bart_tokenizer":      _BART_TOKENIZER,
-    "d_model":             _args.d_model,
-    "use_causal_graph":       not _args.no_causal_graph,
-    "use_char_state_graph":   not _args.no_char_state_graph,
-    "use_char_cooccur_graph": not _args.no_char_cooccur_graph,
-
-    "use_coherence_loss":  not _args.no_coherence_loss,
-    "use_contrastive_loss":not _args.no_contrastive_loss,
-    "use_pointer_head":    not _args.no_pointer_head,
-    "use_raft_v1":         _args.use_raft_v1,
-    "single_binary_graph": _args.single_binary_graph,
-    "entity_penalty":      _args.entity_penalty,
-    "dataset":             _args.dataset,
+    "run_name":             _args.run_name,
+    "bart_model":           _args.bart_model,
+    "bart_tokenizer":       _BART_TOKENIZER,
+    "d_model":              _args.d_model,
+    "num_layers":           _args.num_layers,
+    "no_hypergraph":        _args.no_hypergraph,
+    "static_hypergraph":    _args.static_hypergraph,
+    "no_gru":               _args.no_gru,
+    "no_raft":              _args.no_raft,
+    "no_pointer_head":      _args.no_pointer_head,
+    "no_coherence_loss":    _args.no_coherence_loss,
+    "no_contrastive_loss":  _args.no_contrastive_loss,
+    "entity_penalty":       _args.entity_penalty,
+    "dataset":              _args.dataset,
 }
 
-JSONL_PATH       = "/tmp/uday/mensa_train_data.jsonl.gz"
-MOVIESUM_PATH    = "/tmp/uday/moviesum_data.jsonl.gz"
-# Splits are written as UNCOMPRESSED .jsonl so MensaGraphDataset can use
-# byte-offset seeking (O(1) random access, constant ~50 MB RAM regardless of
-# dataset size).  The compressed source stays as .gz — only the split copies
-# are inflated.  Expect ~55 GB train + ~10 GB eval on /tmp.
+# ── Paths ─────────────────────────────────────────────────────────────────────
+MOVIESUM_JSONL   = "/tmp/uday/moviesum_data.jsonl.gz"
+MENSA_JSONL      = "/tmp/uday/mensa_train_data.jsonl.gz"
+
 TRAIN_SPLIT_PATH = f"/tmp/uday/train_{ABLATION['run_name']}.jsonl"
 EVAL_SPLIT_PATH  = f"/tmp/uday/eval_{ABLATION['run_name']}.jsonl"
-NUM_TRAIN_MOVIES = 700
 
+NUM_TRAIN_MOVIES = 1500   # MovieSum has ~2200 movies; keep ~700 for eval/test
+
+# ── Hyperparameters ───────────────────────────────────────────────────────────
 BATCH_SIZE         = 1
 ACCUMULATION_STEPS = 16
-EPOCHS_STAGE1      = 2    # Encoder frozen
-EPOCHS_STAGE2      = 20   # LoRA encoder unfrozen
+EPOCHS_STAGE1      = 2    # RoBERTa + Mamba frozen; train hypergraph + decoder
+EPOCHS_STAGE2      = 20   # LoRA on Mamba; full model except frozen RoBERTa
 LR_NEW_LAYERS      = 1e-4
 LR_LORA            = 1e-5
+MAX_SEQ_LEN        = 256
+MAX_SCENES         = 64
 
-MAX_SEQ_LEN        = 256   # extraction used 512; we truncate here for speed
-MAX_SCENES         = 64    # 64 scenes ≫ avg movie (most MENSA films have 30-80 scenes)
 
 # =============================================================================
-# MensaGraphDataset (low-level, scene-by-scene reader)
+# Scene-level dataset (lazy byte-offset reader)
 # =============================================================================
 
-class MensaGraphDataset(Dataset):
+class SceneDataset(Dataset):
+    """
+    Reads a flat .jsonl file (uncompressed) scene by scene.
+    Stores byte offsets for O(1) random access; ~50 MB RAM regardless of size.
+
+    Fields returned per scene (dict):
+        input_ids, target_ids, action_mask, dialogue_mask,
+        entity_mask, header_mask, graph_triplets, characters,
+        ner_entities, hyperedge_type, character_emotions, scene_meta, movie_id
+    """
+
     def __init__(self, jsonl_path, max_seq_len=256):
+        if jsonl_path.endswith(".gz"):
+            raise ValueError(
+                f"SceneDataset requires uncompressed .jsonl, got: {jsonl_path}\n"
+                "Run split_dataset_by_movie() first — it writes plain .jsonl splits."
+            )
         self.max_seq_len = max_seq_len
         self.jsonl_path  = jsonl_path
-        # C2: use BART tokenizer — same BPE vocab as RoBERTa, but explicit
-        # decoder_start_token_id=2 semantics match the model's teacher forcing.
         self.tokenizer   = AutoTokenizer.from_pretrained(_BART_TOKENIZER)
         self.movie_ids   = []
 
-        # Index-only pass: store byte offsets so __getitem__ can seek
-        # directly to any record without loading everything into RAM.
-        # This keeps peak memory at ~50 MB regardless of dataset size.
-        # Requires an uncompressed .jsonl file (plain text, seekable).
-        if jsonl_path.endswith(".gz"):
-            raise ValueError(
-                f"MensaGraphDataset requires an uncompressed .jsonl file, "
-                f"got: {jsonl_path}\n"
-                "Run split_dataset_by_movie() first — it writes uncompressed splits."
-            )
-
-        movie_id_re = re.compile(rb'"movie_id"\s*:\s*"([^"]+)"')
-        print(f"Indexing dataset from {jsonl_path}...")
-        self._offsets = []   # byte offset of each valid line
+        mid_re = re.compile(rb'"movie_id"\s*:\s*"([^"]+)"')
+        print(f"Indexing {jsonl_path}...")
+        self._offsets = []
         with open(jsonl_path, "rb") as f:
             while True:
                 offset = f.tell()
@@ -152,11 +167,10 @@ class MensaGraphDataset(Dataset):
                     break
                 if not line.strip():
                     continue
-                m = movie_id_re.search(line)
-                mid = m.group(1).decode("utf-8") if m else "unknown"
+                m = mid_re.search(line)
                 self._offsets.append(offset)
-                self.movie_ids.append(mid)
-        print(f"Indexed {len(self._offsets)} scenes.")
+                self.movie_ids.append(m.group(1).decode() if m else "unknown")
+        print(f"Indexed {len(self._offsets):,} scenes.")
 
     def __len__(self):
         return len(self._offsets)
@@ -165,241 +179,207 @@ class MensaGraphDataset(Dataset):
         with open(self.jsonl_path, "rb") as f:
             f.seek(self._offsets[idx])
             item = json.loads(f.readline())
-        seq_len  = self.max_seq_len
 
-        def _pad_or_trunc(lst, length, pad=1):
-            return (lst + [pad] * length)[:length]
+        L = self.max_seq_len
 
-        def _to_bool_tensor(lst):
-            return torch.tensor(_pad_or_trunc(lst, seq_len, 0), dtype=torch.bool)
+        def _trunc_pad(lst, pad=1):
+            return (lst + [pad] * L)[:L]
 
-        # Adjacency matrix: stored at extraction seq_len (512), truncate to
-        # current seq_len to handle any mismatch safely
-        raw_adj = item["adjacency_matrix"]
-        adj_t   = torch.tensor(raw_adj, dtype=torch.int8) if isinstance(raw_adj, list) else raw_adj
-        adj_t   = adj_t[:seq_len, :seq_len]
-        # Pad to seq_len x seq_len if smaller
-        if adj_t.size(0) < seq_len:
-            pad_adj = torch.zeros(seq_len, seq_len, dtype=torch.int8)
-            pad_adj[:adj_t.size(0), :adj_t.size(1)] = adj_t
-            adj_t = pad_adj
+        def _bool_t(key):
+            return torch.tensor(_trunc_pad(item.get(key, [0] * L), 0), dtype=torch.bool)
 
         return {
-            "input_ids":          torch.tensor(_pad_or_trunc(item["input_ids"],  seq_len), dtype=torch.long),
-            "target_ids":         torch.tensor(_pad_or_trunc(item["target_ids"], seq_len), dtype=torch.long),
-            "action_mask":        _to_bool_tensor(item["action_mask"]),
-            "dialogue_mask":      _to_bool_tensor(item["dialogue_mask"]),
-            "entity_mask":        _to_bool_tensor(item.get("entity_mask", [0] * seq_len)),
-            "header_mask":        _to_bool_tensor(item.get("header_mask", [0] * seq_len)),
-            "graph_triplets":     item.get("graph_triplets", []),
-            "character_emotions": item.get("character_emotions", {}),
-            "characters":         item.get("characters", []),   # speaker names from extractor
-            "scene_meta":         item.get("scene_meta", {}),
             "movie_id":           item["movie_id"],
+            "input_ids":          torch.tensor(_trunc_pad(item["input_ids"]),  dtype=torch.long),
+            "target_ids":         torch.tensor(_trunc_pad(item["target_ids"]), dtype=torch.long),
+            "action_mask":        _bool_t("action_mask"),
+            "dialogue_mask":      _bool_t("dialogue_mask"),
+            "entity_mask":        _bool_t("entity_mask"),
+            "header_mask":        _bool_t("header_mask"),
+            "graph_triplets":     item.get("graph_triplets", []),
+            "characters":         item.get("characters", []),
+            "ner_entities":       item.get("ner_entities", []),      # new
+            "hyperedge_type":     item.get("hyperedge_type", "NEUTRAL"),  # new
+            "character_emotions": item.get("character_emotions", {}),
+            "scene_meta":         item.get("scene_meta", {}),
         }
 
 
 # =============================================================================
-# MovieGraphDatasetV2 — builds 3 typed movie-level graphs
+# Movie-level hypergraph dataset
 # =============================================================================
 
-class MovieGraphDatasetV2(Dataset):
-    def __init__(self, scene_dataset, max_scenes=200):
+class MovieHypergraphDataset(Dataset):
+    """
+    Groups scenes by movie and builds per-movie hypergraph structure:
+
+        incidence_matrix  [MAX_ENTITIES, MAX_SCENES]  float
+            B[n, s] = 1.0 if entity n appears in scene s
+
+        edge_type_ids     [MAX_SCENES]   long
+            Dominant action type of each scene (0–4)
+
+        entity_type_ids   [MAX_ENTITIES] long
+            Semantic type of each entity node (0–4)
+
+        entity_mask       [MAX_ENTITIES] bool
+            True = valid entity (not padding)
+
+    Entity registry is built from:
+        1. NER entities (ner_entities field) — highest quality
+        2. Speaker names (characters field) — screenplay-specific
+        3. SVO subjects/objects (graph_triplets) — broader fallback
+    """
+
+    _STOP = frozenset({
+        "man", "woman", "him", "her", "he", "she", "they", "them",
+        "it", "one", "two", "other", "others", "that", "this", "i",
+        "we", "you", "who", "what", "guy", "person",
+    })
+
+    def __init__(self, scene_dataset, max_scenes=MAX_SCENES,
+                 max_entities=MAX_ENTITIES):
         self.scene_dataset = scene_dataset
         self.max_scenes    = max_scenes
-        self.movie_map     = defaultdict(list)
-        self.adj_cache     = {}
+        self.max_entities  = max_entities
+        self._cache        = {}
 
-        print("Building movie index...")
+        print("Building movie index for hypergraph dataset...")
+        self.movie_map = defaultdict(list)
         for i in range(len(scene_dataset)):
-            raw_id     = scene_dataset.movie_ids[i]
-            movie_name = raw_id.split("_Scene_")[0] if "_Scene_" in raw_id else raw_id
-            self.movie_map[movie_name].append(i)
+            raw = scene_dataset.movie_ids[i]
+            name = raw.split("_Scene_")[0] if "_Scene_" in raw else raw
+            self.movie_map[name].append(i)
         self.movie_names = list(self.movie_map.keys())
-        print(f"Found {len(self.movie_names)} unique movies.")
+        print(f"  {len(self.movie_names):,} movies.")
 
     def __len__(self):
         return len(self.movie_names)
 
+    # ── Entity extraction helpers ──────────────────────────────────────────
+
+    def _scene_entities(self, scene):
+        """
+        Returns dict {normalized_name → entity_type_str} for one scene.
+        Priority: NER > speaker names > SVO subjects/objects.
+        """
+        ents = {}
+
+        # 1. NER entities (best quality)
+        for e in scene.get("ner_entities", []):
+            n = e.get("text", "").strip().lower()
+            t = e.get("type", "OTHER")
+            if n and len(n) > 1 and n not in self._STOP:
+                ents[n] = t
+
+        # 2. Speaker names (PERSON type)
+        for char in scene.get("characters", []):
+            n = char.strip().lower()
+            if n and len(n) > 1 and n not in self._STOP:
+                ents.setdefault(n, "PERSON")
+
+        # 3. SVO subjects and objects (fallback)
+        for trip in scene.get("graph_triplets", []):
+            parts = trip.split("_")
+            for field_idx in (0, 2):
+                if len(parts) > field_idx:
+                    raw = parts[field_idx].replace("NOT ", "").strip().lower()
+                    if raw and raw.isalpha() and len(raw) > 2 and raw not in self._STOP:
+                        ents.setdefault(raw, "OTHER")
+        return ents
+
+    # ── Main item builder ──────────────────────────────────────────────────
+
     def __getitem__(self, idx):
-        movie_name    = self.movie_names[idx]
-        all_indices   = self.movie_map[movie_name]
-        if len(all_indices) > self.max_scenes:
-            # Uniform stride: sample max_scenes scenes spread across the full movie
-            # so the model sees the full narrative arc (not just the opening).
-            step = len(all_indices) / self.max_scenes
-            scene_indices = [all_indices[int(i * step)] for i in range(self.max_scenes)]
+        movie_name = self.movie_names[idx]
+
+        if movie_name in self._cache:
+            return self._cache[movie_name]
+
+        all_indices = self.movie_map[movie_name]
+        S = self.max_scenes
+        N = self.max_entities
+
+        # Stride-sample if movie > max_scenes
+        if len(all_indices) > S:
+            step   = len(all_indices) / S
+            sel    = [all_indices[int(i * step)] for i in range(S)]
         else:
-            scene_indices = all_indices
-        scenes        = [self.scene_dataset[i] for i in scene_indices]
-        num_scenes    = len(scenes)
-        S             = self.max_scenes
+            sel    = all_indices
+        scenes     = [self.scene_dataset[i] for i in sel]
+        num_scenes = len(scenes)
 
-        if movie_name in self.adj_cache:
-            causal_adj, char_state_adj, char_cooccur_adj, idf_weights = \
-                self.adj_cache[movie_name]
-            return {
-                "movie_name":      movie_name,
-                "scenes":          scenes,
-                "causal_adj":      causal_adj,
-                "char_state_adj":  char_state_adj,
-                "char_cooccur_adj": char_cooccur_adj,
-                "idf_weights":     idf_weights,
-            }
+        # ── Build entity registry (capped at N) ──────────────────────────
+        entity_to_idx = {}   # name → int index
+        entity_types  = []   # list of type_id ints
 
-        # ── Entity canonicalization (applied to all 3 graphs) ───────────────
-        # Filter out single-char tokens, pure stopwords, and numeric strings
-        # so that common words ("a", "it", "man") don't create spurious edges.
-        _STOP_ENTITIES = frozenset({
-            "man", "woman", "him", "her", "he", "she", "they", "them",
-            "it", "one", "two", "other", "others", "that", "this",
-        })
+        for scene in scenes:
+            for name, etype in self._scene_entities(scene).items():
+                if name not in entity_to_idx and len(entity_to_idx) < N:
+                    entity_to_idx[name] = len(entity_to_idx)
+                    entity_types.append(ENTITY_TYPE_MAP.get(etype, 4))
 
-        def _canonical_entities(triplet_list, field):
-            """Return lowercase canonical entity set from SVO triplets."""
-            ents = set()
-            for t in triplet_list:
-                parts = t.split("_")
-                if field == "subj" and len(parts) >= 1:
-                    raw = parts[0].replace("NOT ", "").strip().lower()
-                elif field == "obj" and len(parts) >= 3:
-                    raw = parts[2].strip().lower()
-                else:
-                    continue
-                if raw and raw.isalpha() and len(raw) > 1 and raw not in _STOP_ENTITIES:
-                    ents.add(raw)
-            return ents
+        n_valid = len(entity_to_idx)
 
-        def _scene_chars(scene):
-            """All canonical character names for a scene (speaker tags + SVO subjects)."""
-            chars = set()
-            # Priority 1: speaker names from screenplay format (extractor field)
-            for c in scene.get("characters", []):
-                key = c.strip().lower()
-                if key and key.isalpha() and len(key) > 1:
-                    chars.add(key)
-            # Priority 2: SVO subjects (broader but noisier)
-            chars |= _canonical_entities(scene.get("graph_triplets", []), "subj")
-            return chars
+        # ── Tensors ───────────────────────────────────────────────────────
+        entity_type_ids = torch.zeros(N, dtype=torch.long)
+        entity_type_ids[:n_valid] = torch.tensor(entity_types[:n_valid], dtype=torch.long)
 
-        # Pre-compute per-scene entity sets (used in all 3 graph constructions)
-        scene_subj_sets = [
-            _canonical_entities(scenes[i].get("graph_triplets", []), "subj")
-            for i in range(num_scenes)
-        ]
-        scene_obj_sets = [
-            _canonical_entities(scenes[i].get("graph_triplets", []), "obj")
-            for i in range(num_scenes)
-        ]
-        scene_char_sets = [_scene_chars(scenes[i]) for i in range(num_scenes)]
+        entity_mask = torch.zeros(N, dtype=torch.bool)
+        entity_mask[:n_valid] = True
 
-        # ── Graph 1: Causal Event Graph ─────────────────────────────────────
-        # Directed edge i→j: a canonical object entity of scene i is a subject
-        # entity of scene j (entity-resolved causal chain).
-        # Backward edge weighted 0.3 (provides context without reversing direction).
-        causal_adj = torch.zeros(S, S)
-        causal_adj.fill_diagonal_(1.0)
+        # Incidence matrix B [N, S]
+        incidence = torch.zeros(N, S, dtype=torch.float)
+        for s, scene in enumerate(scenes):
+            for name in self._scene_entities(scene):
+                if name in entity_to_idx:
+                    incidence[entity_to_idx[name], s] = 1.0
 
-        for i in range(num_scenes):
-            objs_i = scene_obj_sets[i]
-            if not objs_i:
-                continue
-            for j in range(i + 1, num_scenes):
-                subjs_j = scene_subj_sets[j]
-                if objs_i & subjs_j:
-                    causal_adj[i, j] = 1.0   # directed forward
-                    causal_adj[j, i] = 0.3   # weak backward (context)
+        # Hyperedge types [S]
+        edge_type_ids = torch.zeros(S, dtype=torch.long)
+        for s, scene in enumerate(scenes):
+            htype = scene.get("hyperedge_type", "NEUTRAL")
+            edge_type_ids[s] = HYPEREDGE_TYPE_MAP.get(htype, 4)
 
-        # ── Graph 2: Character State Graph ──────────────────────────────────
-        # Edge weight = mean absolute emotion-polarity change for shared characters.
-        # Uses canonical character keys to improve cross-scene matching.
-        char_state_adj = torch.zeros(S, S)
-        char_state_adj.fill_diagonal_(1.0)
-
-        emotions = [scenes[i]["character_emotions"] for i in range(num_scenes)]
-        for i in range(num_scenes):
-            for j in range(i + 1, num_scenes):
-                shared = set(emotions[i].keys()) & set(emotions[j].keys())
-                if not shared:
-                    continue
-                changes = [abs(emotions[i][c] - emotions[j][c]) for c in shared]
-                weight  = sum(changes) / len(changes)
-                char_state_adj[i, j] = weight
-                char_state_adj[j, i] = weight
-
-        # ── Graph 3: Character Co-occurrence Graph ───────────────────────────
-        # Edge weight = Jaccard similarity of canonical character sets.
-        # Captures which scenes share the same characters — a strong signal for
-        # narrative continuity that neither causal nor emotion graphs capture.
-        char_cooccur_adj = torch.zeros(S, S)
-        char_cooccur_adj.fill_diagonal_(1.0)
-
-        for i in range(num_scenes):
-            chars_i = scene_char_sets[i]
-            if not chars_i:
-                continue
-            for j in range(i + 1, num_scenes):
-                chars_j = scene_char_sets[j]
-                union   = chars_i | chars_j
-                if not union:
-                    continue
-                jaccard = len(chars_i & chars_j) / len(union)
-                if jaccard > 0:
-                    char_cooccur_adj[i, j] = jaccard
-                    char_cooccur_adj[j, i] = jaccard
-
-        # ── IDF weights over entity co-occurrences ──────────────────────────
-        all_entities   = defaultdict(int)
-        scene_ent_sets = []
-        for i in range(num_scenes):
-            ents = scene_subj_sets[i] | scene_obj_sets[i]
-            scene_ent_sets.append(ents)
-            for e in ents:
-                all_entities[e] += 1
-
-        idf_weights = torch.zeros(S, S)
-        N = max(num_scenes, 1)
-        for i in range(num_scenes):
-            for j in range(i + 1, num_scenes):
-                shared = scene_ent_sets[i] & scene_ent_sets[j]
-                if shared:
-                    avg_idf = sum(
-                        math.log(N / max(all_entities[e], 1)) for e in shared
-                    ) / len(shared)
-                    idf_weights[i, j] = avg_idf
-                    idf_weights[j, i] = avg_idf
-
-        self.adj_cache[movie_name] = (causal_adj, char_state_adj, char_cooccur_adj, idf_weights)
-        return {
+        result = {
             "movie_name":       movie_name,
             "scenes":           scenes,
-            "causal_adj":       causal_adj,
-            "char_state_adj":   char_state_adj,
-            "char_cooccur_adj": char_cooccur_adj,
-            "idf_weights":      idf_weights,
+            "incidence_matrix": incidence,       # [N, S]
+            "edge_type_ids":    edge_type_ids,   # [S]
+            "entity_type_ids":  entity_type_ids, # [N]
+            "entity_mask":      entity_mask,     # [N]
         }
+        self._cache[movie_name] = result
+        return result
 
 
 # =============================================================================
 # Collate function
 # =============================================================================
 
-def movie_collate_fn(batch):
+def hypergraph_collate_fn(batch):
+    """
+    Packs a list of movie items into padded batch tensors.
+    Handles variable scene counts (padded to max_scenes in batch).
+    """
     max_scenes = max(len(item["scenes"]) for item in batch)
     seq_len    = len(batch[0]["scenes"][0]["input_ids"])
     B          = len(batch)
+    N          = MAX_ENTITIES
 
-    input_ids  = torch.full((B, max_scenes, seq_len), 1, dtype=torch.long)
-    target_ids = torch.full((B, max_scenes, seq_len), 1, dtype=torch.long)
+    # Scene-level tensors
+    input_ids   = torch.full((B, max_scenes, seq_len), 1, dtype=torch.long)
+    target_ids  = torch.full((B, max_scenes, seq_len), 1, dtype=torch.long)
     action_mask = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
     dial_mask   = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
     ent_mask    = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
     head_mask   = torch.zeros((B, max_scenes, seq_len), dtype=torch.bool)
 
-    causal_adj_b      = torch.zeros((B, max_scenes, max_scenes))
-    char_state_adj_b  = torch.zeros((B, max_scenes, max_scenes))
-    char_cooccur_adj_b = torch.zeros((B, max_scenes, max_scenes))
-    idf_weights_b     = torch.zeros((B, max_scenes, max_scenes))
+    # Hypergraph tensors
+    incidence_matrix = torch.zeros((B, N, max_scenes), dtype=torch.float)
+    edge_type_ids    = torch.zeros((B, max_scenes), dtype=torch.long)
+    entity_type_ids  = torch.zeros((B, N), dtype=torch.long)
+    entity_mask_b    = torch.zeros((B, N), dtype=torch.bool)
 
     all_triplets = []
 
@@ -419,10 +399,10 @@ def movie_collate_fn(batch):
             else:
                 all_triplets.append([])
 
-        causal_adj_b[b, :ns, :ns]       = item["causal_adj"][:ns, :ns]
-        char_state_adj_b[b, :ns, :ns]   = item["char_state_adj"][:ns, :ns]
-        char_cooccur_adj_b[b, :ns, :ns] = item["char_cooccur_adj"][:ns, :ns]
-        idf_weights_b[b, :ns, :ns]      = item["idf_weights"][:ns, :ns]
+        incidence_matrix[b, :, :ns] = item["incidence_matrix"][:, :ns]
+        edge_type_ids[b, :ns]       = item["edge_type_ids"][:ns]
+        entity_type_ids[b]          = item["entity_type_ids"]
+        entity_mask_b[b]            = item["entity_mask"]
 
     return {
         "input_ids":        input_ids,
@@ -431,79 +411,82 @@ def movie_collate_fn(batch):
         "dial_mask":        dial_mask,
         "ent_mask":         ent_mask,
         "head_mask":        head_mask,
-        "causal_adj":       causal_adj_b,
-        "char_state_adj":   char_state_adj_b,
-        "char_cooccur_adj": char_cooccur_adj_b,
-        "idf_weights":      idf_weights_b,
+        "incidence_matrix": incidence_matrix,
+        "edge_type_ids":    edge_type_ids,
+        "entity_type_ids":  entity_type_ids,
+        "entity_mask":      entity_mask_b,
         "triplets":         all_triplets,
     }
 
 
+# Keep old name as alias so existing inference scripts don't break.
+movie_collate_fn = hypergraph_collate_fn
+
+
 # =============================================================================
-# Dataset splitting
+# Dataset splitting (gzip → plain .jsonl)
 # =============================================================================
 
-def split_dataset_by_movie(input_path, train_path, eval_path, num_train=700):
-    print(f"Splitting by movie (train: {num_train})...")
-    
-    # 1. Fail Fast: Make sure the file actually exists and isn't blocking
-    import os
+def split_dataset_by_movie(input_path, train_path, eval_path, num_train=1500):
+    """
+    Splits a .jsonl[.gz] file into uncompressed train/eval .jsonl files,
+    grouped by movie. Uncompressed splits enable byte-offset seeking in
+    SceneDataset (constant-memory O(1) access).
+    """
+    print(f"Splitting {os.path.basename(input_path)} "
+          f"(train: {num_train} movies)...")
     if not os.path.exists(input_path):
-        raise FileNotFoundError(f"CRITICAL ERROR: Input dataset not found at {input_path}")
-        
-    movie_id_re  = re.compile(r'"movie_id"\s*:\s*"([^"]+)"')
+        raise FileNotFoundError(f"Input not found: {input_path}")
+
+    mid_re       = re.compile(r'"movie_id"\s*:\s*"([^"]+)"')
     train_movies = set()
     eval_movies  = set()
     open_fn      = gzip.open if input_path.endswith(".gz") else open
-    out_fn       = gzip.open if train_path.endswith(".gz") else open
 
     with open_fn(input_path, "rt", encoding="utf-8") as inf, \
-         out_fn(train_path, "wt", encoding="utf-8") as tr_out, \
-         out_fn(eval_path,  "wt", encoding="utf-8") as ev_out:
+         open(train_path, "wt", encoding="utf-8") as tr_out, \
+         open(eval_path,  "wt", encoding="utf-8") as ev_out:
 
-        # 2. Add tqdm to the file iterator so you can see the speed (lines/sec)
-        from tqdm import tqdm
-        for line in tqdm(inf, desc="Processing JSONL", unit=" lines"):
+        for line in tqdm(inf, desc="Splitting", unit="lines"):
             if not line.strip():
                 continue
-            match      = movie_id_re.search(line)
-            raw_id     = match.group(1) if match else "unknown"
-            base_name  = raw_id.split("_Scene_")[0] if "_Scene_" in raw_id else raw_id
+            m         = mid_re.search(line)
+            raw_id    = m.group(1) if m else "unknown"
+            base      = raw_id.split("_Scene_")[0] if "_Scene_" in raw_id else raw_id
 
-            if base_name in train_movies:
+            if base in train_movies:
                 tr_out.write(line)
-            elif base_name in eval_movies:
+            elif base in eval_movies:
                 ev_out.write(line)
+            elif len(train_movies) < num_train:
+                train_movies.add(base)
+                tr_out.write(line)
             else:
-                if len(train_movies) < num_train:
-                    train_movies.add(base_name)
-                    tr_out.write(line)
-                else:
-                    eval_movies.add(base_name)
-                    ev_out.write(line)
+                eval_movies.add(base)
+                ev_out.write(line)
 
-    print(f"Split complete: {len(train_movies)} train / {len(eval_movies)} eval movies")
+    print(f"Split done: {len(train_movies)} train / {len(eval_movies)} eval movies.")
+
 
 # =============================================================================
-# Beam-search generation (proper inference for ROUGE eval)
+# Beam-search generation
 # =============================================================================
 
 @torch.no_grad()
 def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
                      device, max_new_tokens=200, beam_size=4):
     """
-    Beam search over the BART decoder using the pre-computed aligned_memory.
-    Returns decoded string.
+    Beam search over the BART decoder using pre-computed aligned_memory.
+    aligned_memory  : [1, S+N, D]
+    enc_attn_mask   : [1, S+N]
     """
     B = aligned_memory.size(0)
-    assert B == 1, "generate_summary expects batch size 1"
+    assert B == 1
 
-    # Initialise beams: (score, token_ids)
-    beams = [(0.0, [tokenizer.bos_token_id or 0])]
+    beams     = [(0.0, [tokenizer.bos_token_id or 0])]
     completed = []
-
-    eos_id = tokenizer.eos_token_id or 2
-    pad_id = tokenizer.pad_token_id or 1
+    eos_id    = tokenizer.eos_token_id or 2
+    pad_id    = tokenizer.pad_token_id or 1
 
     for _ in range(max_new_tokens):
         new_beams = []
@@ -511,138 +494,158 @@ def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
             if tokens[-1] == eos_id:
                 completed.append((score, tokens))
                 continue
-            t_ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            t_ids  = torch.tensor([tokens], dtype=torch.long, device=device)
             t_mask = (t_ids != pad_id).long()
-
             dec_out = model.bart_decoder(
                 input_ids=t_ids,
                 attention_mask=t_mask,
                 encoder_hidden_states=aligned_memory,
                 encoder_attention_mask=enc_attn_mask,
             )
-            logits     = model.head(dec_out.last_hidden_state[:, -1, :]).float()
-            log_probs  = F.log_softmax(logits, dim=-1).squeeze(0)
+            logits    = model.head(dec_out.last_hidden_state[:, -1, :]).float()
+            log_probs = F.log_softmax(logits, dim=-1).squeeze(0)
 
             # No-repeat trigram penalty
             if len(tokens) >= 3:
-                ngrams = set(
-                    tuple(tokens[k:k + 3])
-                    for k in range(len(tokens) - 2)
-                )
-                for ng in ngrams:
-                    if len(ng) == 3:
-                        log_probs[ng[-1]] = -1e4  # F7: avoid -inf NaN in bfloat16
+                for k in range(len(tokens) - 2):
+                    ng = tuple(tokens[k:k + 3])
+                    log_probs[ng[-1]] = -1e4   # avoid -inf in bfloat16
 
-            top_vals, top_idx = log_probs.topk(beam_size)
-            for v, idx in zip(top_vals.tolist(), top_idx.tolist()):
+            top_v, top_i = log_probs.topk(beam_size)
+            for v, idx in zip(top_v.tolist(), top_i.tolist()):
                 new_beams.append((score + v, tokens + [idx]))
 
         beams = sorted(new_beams, key=lambda x: x[0], reverse=True)[:beam_size]
-        if len(beams) == 0:
+        if not beams:
             break
 
-    if completed:
-        best = max(completed, key=lambda x: x[0] / max(len(x[1]), 1))
-    else:
-        best = max(beams, key=lambda x: x[0])
-
+    pool      = completed if completed else beams
+    best      = max(pool, key=lambda x: x[0] / max(len(x[1]), 1))
     return tokenizer.decode(best[1], skip_special_tokens=True)
 
 
 # =============================================================================
-# Main training loop
+# Training
 # =============================================================================
-
-import torch.nn.functional as F   # needed for generate_summary above
 
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on {device}")
     torch.cuda.empty_cache()
 
-    # ── 1. Data splits ───────────────────────────────────────────────────────
+    # ── 1. Dataset selection ─────────────────────────────────────────────────
+    src_path = MOVIESUM_JSONL if ABLATION["dataset"] in ("moviesum", "both") else MENSA_JSONL
     if not (os.path.exists(TRAIN_SPLIT_PATH) and os.path.exists(EVAL_SPLIT_PATH)):
-        split_dataset_by_movie(JSONL_PATH, TRAIN_SPLIT_PATH, EVAL_SPLIT_PATH,
+        split_dataset_by_movie(src_path, TRAIN_SPLIT_PATH, EVAL_SPLIT_PATH,
                                num_train=NUM_TRAIN_MOVIES)
 
     EPOCHS = EPOCHS_STAGE1 + EPOCHS_STAGE2
 
     wandb.init(
-        project="GraM-Former-v2",
+        project="DualTower-Hypergraph",
         name=ABLATION["run_name"],
         config={
-            "lr_new":          LR_NEW_LAYERS,
-            "lr_lora":         LR_LORA,
-            "epochs":          EPOCHS,
-            "batch_size":      BATCH_SIZE,
-            "accum_steps":     ACCUMULATION_STEPS,
-            "max_seq_len":     MAX_SEQ_LEN,
-            "architecture":    "GraM-Former-v2 HGT",
+            "lr_new": LR_NEW_LAYERS, "lr_lora": LR_LORA,
+            "epochs": EPOCHS, "batch_size": BATCH_SIZE,
+            "accum_steps": ACCUMULATION_STEPS,
+            "max_seq_len": MAX_SEQ_LEN, "max_entities": MAX_ENTITIES,
+            "architecture": "DualTowerHypergraphSummariser",
             **ABLATION,
         },
     )
 
     # ── 2. Datasets ───────────────────────────────────────────────────────────
-    base_train = MensaGraphDataset(TRAIN_SPLIT_PATH, max_seq_len=MAX_SEQ_LEN)
-    base_eval  = MensaGraphDataset(EVAL_SPLIT_PATH,  max_seq_len=MAX_SEQ_LEN)
-    train_ds   = MovieGraphDatasetV2(base_train, max_scenes=MAX_SCENES)
-    eval_ds    = MovieGraphDatasetV2(base_eval,  max_scenes=MAX_SCENES)
+    base_train = SceneDataset(TRAIN_SPLIT_PATH, max_seq_len=MAX_SEQ_LEN)
+    base_eval  = SceneDataset(EVAL_SPLIT_PATH,  max_seq_len=MAX_SEQ_LEN)
+    train_ds   = MovieHypergraphDataset(base_train, max_scenes=MAX_SCENES)
+    eval_ds    = MovieHypergraphDataset(base_eval,  max_scenes=MAX_SCENES)
 
-    train_dl   = DataLoader(train_ds, batch_size=1, shuffle=True,
-                            num_workers=4, pin_memory=True,
-                            persistent_workers=True,
-                            collate_fn=movie_collate_fn)
-    eval_dl    = DataLoader(eval_ds,  batch_size=1, shuffle=False,
-                            num_workers=4, pin_memory=True,
-                            persistent_workers=True,
-                            collate_fn=movie_collate_fn)
+    train_dl = DataLoader(train_ds, batch_size=1, shuffle=True,
+                          num_workers=4, pin_memory=True,
+                          persistent_workers=True,
+                          collate_fn=hypergraph_collate_fn)
+    eval_dl  = DataLoader(eval_ds,  batch_size=1, shuffle=False,
+                          num_workers=4, pin_memory=True,
+                          persistent_workers=True,
+                          collate_fn=hypergraph_collate_fn)
 
     # ── 3. Model ──────────────────────────────────────────────────────────────
     tokenizer = base_train.tokenizer
-
-    # Apply ablation backbone settings to sum.py module globals
     _sum_module.BART_MODEL = ABLATION["bart_model"]
 
-    # Swap RAFT v1 for ablation if requested
-    if ABLATION["use_raft_v1"]:
-        from sum import RaftConsensusAttention as _RaftV1
-        _sum_module.RaftConsensusAttentionV2 = _RaftV1
-        print("ABLATION: using RAFT v1 (no cross-modal attention)")
-
-    model = GraMFormerV2(
+    model = DualTowerHypergraphSummariser(
         vocab_size=len(tokenizer),
         d_model=ABLATION["d_model"],
-        num_layers=4,
+        num_layers=ABLATION["num_layers"],
+        max_entities=MAX_ENTITIES,
         tokenizer=tokenizer,
     ).to(device)
-    print(f"Model backbone: {ABLATION['bart_model']}  d_model={ABLATION['d_model']}")
+    print(f"Model: d_model={ABLATION['d_model']}  num_layers={ABLATION['num_layers']}")
 
-    print("Xavier init on new layers...")
-    _skip_init = {"embedding", "head", "roberta", "scene_proj"}
+    # Ablation: disable hypergraph tower (text-only baseline)
+    if ABLATION["no_hypergraph"]:
+        import types
+        def _noop_hyp(self, scene_reps, inc, etype, entype, emask):
+            return scene_reps, torch.zeros(
+                scene_reps.size(0), self.max_entities, self.d_model,
+                device=scene_reps.device
+            )
+        model.hypergraph_tower.forward = types.MethodType(
+            _noop_hyp, model.hypergraph_tower
+        )
+        print("ABLATION: hypergraph tower disabled (text-only baseline)")
+
+    # Ablation: static hypergraph — freeze entity states after init
+    # (DiscoGraMS-style: graph is built once, never updated)
+    if ABLATION["static_hypergraph"]:
+        for p in model.hypergraph_tower.entity_gru.parameters():
+            p.requires_grad = False
+        print("ABLATION: GRU frozen → static hypergraph (DiscoGraMS baseline)")
+
+    # Ablation: disable GRU, use EMA instead
+    if ABLATION["no_gru"] and not ABLATION["static_hypergraph"]:
+        import types
+        _alpha = 0.7
+        def _ema_update(self, msg_flat, h_flat):
+            return _alpha * h_flat + (1 - _alpha) * msg_flat
+        model.hypergraph_tower.entity_gru.forward = types.MethodType(
+            _ema_update, model.hypergraph_tower.entity_gru
+        )
+        print(f"ABLATION: GRU replaced with EMA (α={_alpha})")
+
+    # Ablation: disable RAFT
+    if ABLATION["no_raft"]:
+        import types
+        def _raft_noop(self, features, *masks):
+            return features
+        model.raft.forward = types.MethodType(_raft_noop, model.raft)
+        print("ABLATION: RAFT disabled")
+
+    # Ablation: disable pointer head
+    if ABLATION["no_pointer_head"]:
+        import types
+        def _no_ptr(self, dec, mem, trips, tok, emb, dev):
+            B, T, D = dec.shape
+            return (torch.ones(B, T, 1, device=dev),
+                    torch.zeros(B, T, self.vocab_size, device=dev))
+        model.pointer_head.forward = types.MethodType(_no_ptr, model.pointer_head)
+        print("ABLATION: pointer head disabled")
+
+    # Xavier init for new (non-pretrained) layers
+    _skip = {"roberta", "bart_decoder", "head", "scene_proj"}
     for name, param in model.named_parameters():
-        if param.requires_grad and not any(s in name for s in _skip_init):
+        if param.requires_grad and not any(s in name for s in _skip):
             if len(param.shape) > 1:
                 torch.nn.init.xavier_uniform_(param)
 
-    # Ablation: disable pointer head by making p_gen always 1.0 (pure generation)
-    if not ABLATION["use_pointer_head"]:
-        import types
-        def _no_pointer(self, dec_states, scene_mem, trips, tok, emb_w, dev):
-            B, T, D = dec_states.shape
-            p_gen       = torch.ones(B, T, 1, device=dev)
-            ptr_probs   = torch.zeros(B, T, self.vocab_size, device=dev)
-            return p_gen, ptr_probs
-        model.pointer_head.forward = types.MethodType(_no_pointer, model.pointer_head)
-        print("ABLATION: pointer head disabled (p_gen=1 always)")
-
     # ── 4. Checkpoint resumption ──────────────────────────────────────────────
-    ckpt_path   = "/tmp/uday/checkpoints/gramformer_v2_latest.pt"
+    ckpt_latest = "/tmp/uday/checkpoints/dual_hyp_latest.pt"
     start_epoch = 0
-    checkpoint  = None
-    if os.path.exists(ckpt_path):
-        print(f"Resuming from {ckpt_path}...")
-        checkpoint  = torch.load(ckpt_path, map_location=device, weights_only=True)
-        start_epoch = checkpoint.get("epoch", 0)
+    ckpt_state  = None
+    if os.path.exists(ckpt_latest):
+        print(f"Resuming from {ckpt_latest}...")
+        ckpt_state  = torch.load(ckpt_latest, map_location=device, weights_only=True)
+        start_epoch = ckpt_state.get("epoch", 0)
 
     # ── 5. Stage setup ────────────────────────────────────────────────────────
     lora_applied = False
@@ -654,349 +657,324 @@ def train():
             target_modules=["in_proj", "x_proj", "out_proj", "dt_proj"],
             lora_dropout=0.05, bias="none",
         )
-        model.encoder = get_peft_model(model.encoder, lora_cfg)
-        lora_applied  = True
+        model.mamba_tower = get_peft_model(model.mamba_tower, lora_cfg)
+        lora_applied = True
         model.enable_gradient_checkpointing()
+        print(f"LoRA applied: r={r}, alpha={alpha}")
 
-    def _freeze_roberta(model):
-        """RoBERTa stays frozen throughout all training stages."""
-        for name, param in model.named_parameters():
+    def _set_stage1_grads():
+        """Stage 1: freeze RoBERTa + Mamba; train hypergraph + decoder cross-attn."""
+        for name, p in model.named_parameters():
+            p.requires_grad = not any(s in name for s in
+                                      ["roberta", "mamba_tower"])
+
+    def _set_stage2_grads():
+        """Stage 2: freeze RoBERTa only; LoRA on Mamba; train everything else."""
+        for name, p in model.named_parameters():
             if "roberta" in name:
-                param.requires_grad = False
+                p.requires_grad = False
+            elif "bart_decoder.layers" in name and "encoder_attn" not in name:
+                p.requires_grad = False
+            elif "head." in name:
+                p.requires_grad = False
+            else:
+                p.requires_grad = True
 
     if start_epoch >= EPOCHS_STAGE1:
         apply_lora(r=64, alpha=128)
-        for name, param in model.named_parameters():
-            if "roberta" in name:
-                param.requires_grad = False          # A1: always frozen
-            elif "bart_decoder.layers" in name and "encoder_attn" not in name:
-                param.requires_grad = False
-            elif name.startswith("head."):
-                param.requires_grad = False
-            else:
-                param.requires_grad = True
+        _set_stage2_grads()
     else:
-        # Stage 1: freeze Mamba encoder and RoBERTa, train everything else
-        for name, param in model.named_parameters():
-            param.requires_grad = (
-                "encoder" not in name and "roberta" not in name
-            )
+        _set_stage1_grads()
 
-    if checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    if ckpt_state:
+        model.load_state_dict(ckpt_state["model_state_dict"], strict=False)
 
-    # ── 6. Criterion ──────────────────────────────────────────────────────────
+    # ── 6. Loss ───────────────────────────────────────────────────────────────
     criterion = RelationalEventConsistencyLoss(
-        alpha=0.1 if ABLATION["use_contrastive_loss"] else 0.0,
+        alpha=0.1 if not ABLATION["no_contrastive_loss"] else 0.0,
         tokenizer=tokenizer,
         entity_penalty=ABLATION["entity_penalty"],
         label_smoothing=0.1,
-        coherence_weight=0.05 if ABLATION["use_coherence_loss"] else 0.0,
+        coherence_weight=0.05 if not ABLATION["no_coherence_loss"] else 0.0,
     )
-    if not ABLATION["use_contrastive_loss"]:
-        print("ABLATION: contrastive loss disabled")
-    if not ABLATION["use_coherence_loss"]:
-        print("ABLATION: narrative coherence loss disabled")
 
-    # ── 7. Optimiser — separate LR groups ────────────────────────────────────
-    def _make_optimizer(model):
-        lora_params  = [p for n, p in model.named_parameters()
-                        if p.requires_grad and "lora_" in n]
-        other_params = [p for n, p in model.named_parameters()
-                        if p.requires_grad and "lora_" not in n]
+    # ── 7. Optimiser ──────────────────────────────────────────────────────────
+    def _make_optim():
+        lora_p  = [p for n, p in model.named_parameters()
+                   if p.requires_grad and "lora_" in n]
+        other_p = [p for n, p in model.named_parameters()
+                   if p.requires_grad and "lora_" not in n]
         return AdamW([
-            {"params": other_params, "lr": LR_NEW_LAYERS},
-            {"params": lora_params,  "lr": LR_LORA},
+            {"params": other_p, "lr": LR_NEW_LAYERS},
+            {"params": lora_p,  "lr": LR_LORA},
         ], weight_decay=0.01)
 
-    optimizer = _make_optimizer(model)
+    optimizer = _make_optim()
     scaler    = torch.cuda.amp.GradScaler()
     wandb.watch(model, criterion, log="all", log_freq=50)
 
-    total_steps       = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
-    warmup_steps      = int(0.05 * total_steps)
-    scheduler         = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    total_steps  = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
+    warmup_steps = int(0.05 * total_steps)
+    scheduler    = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
     )
 
-    # N1: evaluation metrics — ROUGE, BERTScore, METEOR
-    rouge      = hf_evaluate.load("rouge")
-    bertscore  = hf_evaluate.load("bertscore")
-    meteor     = hf_evaluate.load("meteor")
+    # ── 8. Evaluation metrics ─────────────────────────────────────────────────
+    rouge_metric     = hf_evaluate.load("rouge")
+    bertscore_metric = hf_evaluate.load("bertscore")
+    meteor_metric    = hf_evaluate.load("meteor")
 
-    # N2: entity F1 — use a minimal spaCy NER pipeline (en_core_web_sm)
     import spacy as _spacy
-    _nlp_ner = _spacy.load("en_core_web_sm", disable=["parser", "tagger", "lemmatizer"])
+    _nlp_ner = _spacy.load("en_core_web_sm",
+                           disable=["parser", "tagger", "lemmatizer"])
 
     def _entity_f1(preds, refs):
-        """Micro-averaged entity F1 using spaCy NER on preds vs refs."""
         tp = fp = fn = 0
         for pred, ref in zip(preds, refs):
-            p_ents = {e.text.lower() for e in _nlp_ner(pred).ents}
-            r_ents = {e.text.lower() for e in _nlp_ner(ref).ents}
-            tp += len(p_ents & r_ents)
-            fp += len(p_ents - r_ents)
-            fn += len(r_ents - p_ents)
+            p_e = {e.text.lower() for e in _nlp_ner(pred).ents}
+            r_e = {e.text.lower() for e in _nlp_ner(ref).ents}
+            tp += len(p_e & r_e)
+            fp += len(p_e - r_e)
+            fn += len(r_e - p_e)
         prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         return (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
 
-    # ── 8. Training loop ──────────────────────────────────────────────────────
-    for epoch in range(start_epoch, EPOCHS):
+    # ── 9. Training loop ──────────────────────────────────────────────────────
+    global_step = 0
 
-        # Curriculum: entity penalty and contrastive alpha
+    for epoch in range(start_epoch, EPOCHS_STAGE1 + EPOCHS_STAGE2):
+
+        # Curriculum: entity penalty and alpha anneal in stage 2
         if epoch >= EPOCHS_STAGE1:
-            stage2_ep = epoch - EPOCHS_STAGE1
-            criterion.alpha        = 0.2 + 0.3 * (stage2_ep / max(1, EPOCHS_STAGE2 - 1))
-            criterion.entity_penalty = 3.0 + 4.0 * (stage2_ep / max(1, EPOCHS_STAGE2 - 1))
+            s2 = epoch - EPOCHS_STAGE1
+            criterion.alpha         = 0.2 + 0.3 * (s2 / max(1, EPOCHS_STAGE2 - 1))
+            criterion.entity_penalty = 3.0 + 4.0 * (s2 / max(1, EPOCHS_STAGE2 - 1))
         else:
-            criterion.alpha        = 0.1
+            criterion.alpha         = 0.1
             criterion.entity_penalty = 3.0
 
-        print(f"\n[Epoch {epoch + 1}/{EPOCHS}] α={criterion.alpha:.3f}  "
-              f"entity_pen={criterion.entity_penalty:.2f}")
+        print(f"\n[Epoch {epoch+1}/{EPOCHS_STAGE1+EPOCHS_STAGE2}]  "
+              f"α={criterion.alpha:.3f}  entity_pen={criterion.entity_penalty:.2f}")
 
-        # Stage transition
+        # Stage transition at epoch EPOCHS_STAGE1
         if epoch == EPOCHS_STAGE1 and not lora_applied:
-            print("→ Transitioning to Stage 2: applying LoRA to Mamba encoder")
+            print("→ Stage 2: applying LoRA to Mamba tower")
             apply_lora(r=16, alpha=32)
-            for name, param in model.named_parameters():
-                if "roberta" in name:
-                    param.requires_grad = False      # A1: keep frozen
-                elif "encoder" not in name:
-                    param.requires_grad = True
-            optimizer = _make_optimizer(model)
+            _set_stage2_grads()
+            optimizer = _make_optim()
             scaler    = torch.cuda.amp.GradScaler(enabled=False)
-            stage2_total  = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS_STAGE2
-            warmup2       = int(0.05 * stage2_total)
-            scheduler     = get_cosine_schedule_with_warmup(
-                optimizer, num_warmup_steps=warmup2,
-                num_training_steps=stage2_total
+            s2_total  = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS_STAGE2
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer, num_warmup_steps=int(0.05 * s2_total),
+                num_training_steps=s2_total
             )
 
-        # ── Train ────────────────────────────────────────────────────────────
+        # ── Train ─────────────────────────────────────────────────────────────
         model.train()
-        total_train_loss = 0.0
+        train_loss_sum = 0.0
         optimizer.zero_grad()
 
-        bar = tqdm(train_dl, desc=f"E{epoch + 1} Train", unit="batch")
-        for batch_idx, batch in enumerate(bar):
-            inp    = batch["input_ids"].to(device)
-            a_mask = batch["action_mask"].to(device)
-            d_mask = batch["dial_mask"].to(device)
-            e_mask = batch["ent_mask"].to(device)
-            h_mask = batch["head_mask"].to(device)
-            c_adj  = batch["causal_adj"].to(device)
-            cs_adj = batch["char_state_adj"].to(device)
-            cc_adj = batch["char_cooccur_adj"].to(device)
-            idf_w  = batch["idf_weights"].to(device)
-            tgt    = batch["target_ids"].to(device)
-            trips  = batch["triplets"]
-
-            # Zero out graphs disabled by ablation flags
-            if not ABLATION["use_causal_graph"]:
-                c_adj  = torch.zeros_like(c_adj)
-            if not ABLATION["use_char_state_graph"]:
-                cs_adj = torch.zeros_like(cs_adj)
-            if not ABLATION["use_char_cooccur_graph"]:
-                cc_adj = torch.zeros_like(cc_adj)
-            if ABLATION["single_binary_graph"]:
-                # Collapse all 3 graphs to one binary adj (v1 baseline)
-                binary = ((c_adj + cs_adj + cc_adj) > 0).float()
-                c_adj = cs_adj = cc_adj = binary
+        bar = tqdm(train_dl, desc=f"E{epoch+1} Train", unit="batch")
+        for bi, batch in enumerate(bar):
+            inp  = batch["input_ids"].to(device)
+            amsk = batch["action_mask"].to(device)
+            dmsk = batch["dial_mask"].to(device)
+            emsk = batch["ent_mask"].to(device)
+            hmsk = batch["head_mask"].to(device)
+            inc  = batch["incidence_matrix"].to(device)
+            etid = batch["edge_type_ids"].to(device)
+            enid = batch["entity_type_ids"].to(device)
+            emk  = batch["entity_mask"].to(device)
+            tgt  = batch["target_ids"].to(device)
+            trip = batch["triplets"]
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits, enc_mem, labels, _, gated_causal = model(
-                    inp, a_mask, d_mask, e_mask, h_mask,
-                    c_adj, cs_adj, cc_adj, tgt, trips, idf_w
+                log_pr, H_text_4d, labels, _, H_hyp = model(
+                    inp, amsk, dmsk, emsk, hmsk,
+                    inc, etid, enid, emk,
+                    target_ids=tgt, triplets=trip,
                 )
-                logits = logits.float()
+                log_pr = log_pr.float()
                 loss   = criterion(
-                    log_probs=logits.view(-1, logits.size(-1)),
+                    log_probs=log_pr.view(-1, log_pr.size(-1)),
                     targets=labels.view(-1),
-                    triplets=trips,
-                    hidden_states=enc_mem,
+                    triplets=trip,
+                    hidden_states=H_text_4d,
                     head_weight=model.head.weight,
-
-                    causal_adj=gated_causal,
+                    incidence_matrix=inc,
                 )
-                ortho = criterion.get_riemannian_orthogonality_loss(model)
-                loss  = loss + 0.001 * ortho
-                loss  = loss / ACCUMULATION_STEPS
+                loss = loss / ACCUMULATION_STEPS
 
             val = loss.item() * ACCUMULATION_STEPS
             if math.isnan(val) or math.isinf(val):
-                print(f"  ⚠ Explosion at batch {batch_idx} — skipping")
+                print(f"  ⚠ NaN/Inf at batch {bi}, skipping")
                 optimizer.zero_grad()
                 continue
 
             scaler.scale(loss).backward()
 
-            if (batch_idx + 1) % ACCUMULATION_STEPS == 0 or \
-               (batch_idx + 1) == len(train_dl):
+            if (bi + 1) % ACCUMULATION_STEPS == 0 or (bi + 1) == len(train_dl):
                 scaler.unscale_(optimizer)
                 nn_utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
                 optimizer.zero_grad()
+                global_step += 1
 
-            total_train_loss += val
+                # Log entity state norms every 100 steps
+                if global_step % 100 == 0:
+                    with torch.no_grad():
+                        _, H_t4d = model(
+                            inp, amsk, dmsk, emsk, hmsk,
+                            inc, etid, enid, emk,
+                            target_ids=None, triplets=None,
+                        )
+                    # Run hypergraph tower alone for node states
+                    H_t = H_t4d.mean(dim=2)
+                    _, H_nodes = model.hypergraph_tower(H_t, inc, etid, enid, emk)
+                    log_entity_state_norms(H_nodes, emk, global_step)
+
+            train_loss_sum += val
             lr_now = optimizer.param_groups[0]["lr"]
             bar.set_postfix(loss=f"{val:.4f}", lr=f"{lr_now:.2e}")
             wandb.log({
-                "train_batch_loss": val,
-                "learning_rate":    lr_now,
-                "alpha":            criterion.alpha,
-                "entity_penalty":   criterion.entity_penalty,
+                "train/batch_loss": val,
+                "train/lr":         lr_now,
+                "train/alpha":      criterion.alpha,
                 "epoch":            epoch + 1,
             })
 
-        avg_train_loss = total_train_loss / max(len(train_dl), 1)
+        avg_train = train_loss_sum / max(len(train_dl), 1)
 
-        # ── Eval ─────────────────────────────────────────────────────────────
+        # ── Eval ──────────────────────────────────────────────────────────────
         model.eval()
-        total_eval_loss = 0.0
+        eval_loss_sum = 0.0
         all_preds, all_refs = [], []
 
-        bar_e = tqdm(eval_dl, desc=f"E{epoch + 1} Eval", unit="batch")
+        bar_e = tqdm(eval_dl, desc=f"E{epoch+1} Eval", unit="batch")
         with torch.no_grad():
-            for batch_idx, batch in enumerate(bar_e):
-                inp    = batch["input_ids"].to(device)
-                a_mask = batch["action_mask"].to(device)
-                d_mask = batch["dial_mask"].to(device)
-                e_mask = batch["ent_mask"].to(device)
-                h_mask = batch["head_mask"].to(device)
-                c_adj  = batch["causal_adj"].to(device)
-                cs_adj = batch["char_state_adj"].to(device)
-                cc_adj = batch["char_cooccur_adj"].to(device)
-                idf_w  = batch["idf_weights"].to(device)
-                tgt    = batch["target_ids"].to(device)
-                trips  = batch["triplets"]
-
-                if not ABLATION["use_causal_graph"]:
-                    c_adj  = torch.zeros_like(c_adj)
-                if not ABLATION["use_char_state_graph"]:
-                    cs_adj = torch.zeros_like(cs_adj)
-                if not ABLATION["use_char_cooccur_graph"]:
-                    cc_adj = torch.zeros_like(cc_adj)
-                if ABLATION["single_binary_graph"]:
-                    binary = ((c_adj + cs_adj + cc_adj) > 0).float()
-                    c_adj = cs_adj = cc_adj = binary
+            for bi, batch in enumerate(bar_e):
+                inp  = batch["input_ids"].to(device)
+                amsk = batch["action_mask"].to(device)
+                dmsk = batch["dial_mask"].to(device)
+                emsk = batch["ent_mask"].to(device)
+                hmsk = batch["head_mask"].to(device)
+                inc  = batch["incidence_matrix"].to(device)
+                etid = batch["edge_type_ids"].to(device)
+                enid = batch["entity_type_ids"].to(device)
+                emk  = batch["entity_mask"].to(device)
+                tgt  = batch["target_ids"].to(device)
+                trip = batch["triplets"]
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits, enc_mem, labels, _, gated_causal = model(
-                        inp, a_mask, d_mask, e_mask, h_mask,
-                        c_adj, cs_adj, cc_adj, tgt, trips, idf_w
+                    log_pr, H_text_4d, labels, _, H_hyp = model(
+                        inp, amsk, dmsk, emsk, hmsk,
+                        inc, etid, enid, emk,
+                        target_ids=tgt, triplets=trip,
                     )
-                    logits  = logits.float()
-                    e_loss  = criterion(
-                        log_probs=logits.view(-1, logits.size(-1)),
+                    log_pr = log_pr.float()
+                    eloss  = criterion(
+                        log_probs=log_pr.view(-1, log_pr.size(-1)),
                         targets=labels.view(-1),
-                        triplets=trips,
-                        hidden_states=enc_mem,
+                        triplets=trip,
+                        hidden_states=H_text_4d,
                         head_weight=model.head.weight,
-                        causal_adj=gated_causal,
+                        incidence_matrix=inc,
                     )
 
-                total_eval_loss += e_loss.item()
-                bar_e.set_postfix(eval_loss=f"{e_loss.item():.4f}")
+                eval_loss_sum += eloss.item()
+                bar_e.set_postfix(eval_loss=f"{eloss.item():.4f}")
 
-                # ── Beam-search generation (every 10th batch) ────────────────
-                if batch_idx % 10 == 0:
+                # Beam-search generation every 10th batch
+                if bi % 10 == 0:
                     aligned_mem, _ = model(
-                        inp, a_mask, d_mask, e_mask, h_mask,
-                        c_adj, cs_adj, cc_adj,
-                        target_ids=None, triplets=None, idf_weights=idf_w,
+                        inp, amsk, dmsk, emsk, hmsk,
+                        inc, etid, enid, emk,
+                        target_ids=None, triplets=None,
                     )
-                    mem_pad_mask  = (inp[:, :, 0] == 1)
-                    enc_attn_mask = (~mem_pad_mask).long()
+                    # enc_attn_mask: scenes + entity nodes
+                    mem_pad = torch.zeros(
+                        aligned_mem.size(0), aligned_mem.size(1),
+                        dtype=torch.bool, device=device
+                    )
+                    mem_pad[:, :inp.size(1)] = (inp[:, :, 0] == 1)
+                    mem_pad[:, inp.size(1):] = ~emk
+                    all_masked = mem_pad.all(dim=1)
+                    mem_pad[all_masked, 0] = False
+                    enc_attn = (~mem_pad).long()
 
                     pred = generate_summary(
-                        model, aligned_mem, enc_attn_mask, tokenizer, device,
-                        max_new_tokens=200, beam_size=4,
+                        model, aligned_mem, enc_attn, tokenizer,
+                        device, max_new_tokens=200, beam_size=4,
                     )
                     ref  = tokenizer.decode(
                         tgt[0, 0].cpu().tolist(), skip_special_tokens=True
                     )
                     all_preds.append(pred)
                     all_refs.append(ref)
-
                     wandb.log({
-                        "sample_pred": wandb.Html(
+                        "eval/sample": wandb.Html(
                             f"<b>Pred:</b> {pred}<br><b>Ref:</b> {ref}"
                         ),
                         "epoch": epoch + 1,
                     })
 
-                    if batch_idx % 50 == 0:
-                        log_character_attention_map(model, enc_mem, c_adj)
-                        log_character_attention_map_labeled(
-                            model, enc_mem, c_adj, trips
-                        )
+                    # Hyperedge similarity heatmap every 50th batch
+                    if bi % 50 == 0:
+                        log_hyperedge_attention(model, H_hyp, inc,
+                                                batch.get("movie_name", [""])[0])
 
-        avg_eval_loss = total_eval_loss / max(len(eval_dl), 1)
+        avg_eval = eval_loss_sum / max(len(eval_dl), 1)
 
-        # ── ROUGE ────────────────────────────────────────────────────────────
-        rouge_scores = {}
-        bs_f1 = met_score = ent_f1 = 0.0
+        # ── Metrics ───────────────────────────────────────────────────────────
+        r1 = r2 = rL = bs_f1 = met = ent_f1 = 0.0
         if all_preds:
-            rouge_scores = rouge.compute(
-                predictions=all_preds, references=all_refs, use_stemmer=True,
-            )
-            # N1: BERTScore (deberta-xlarge-mnli is slow; use roberta-large)
-            bs_out   = bertscore.compute(
+            rs   = rouge_metric.compute(predictions=all_preds, references=all_refs,
+                                        use_stemmer=True)
+            r1, r2, rL = rs["rouge1"], rs["rouge2"], rs["rougeL"]
+
+            bs_out = bertscore_metric.compute(
                 predictions=all_preds, references=all_refs,
                 lang="en", model_type="roberta-large",
             )
-            bs_f1    = sum(bs_out["f1"]) / max(len(bs_out["f1"]), 1)
-            # N1: METEOR
-            met_score = meteor.compute(
-                predictions=all_preds, references=all_refs,
+            bs_f1  = sum(bs_out["f1"]) / max(len(bs_out["f1"]), 1)
+
+            met    = meteor_metric.compute(
+                predictions=all_preds, references=all_refs
             )["meteor"]
-            # N2: entity F1
+
             ent_f1 = _entity_f1(all_preds, all_refs)
 
-        r1 = rouge_scores.get("rouge1", 0.0)
-        r2 = rouge_scores.get("rouge2", 0.0)
-        rL = rouge_scores.get("rougeL", 0.0)
-
-        print(f"Epoch {epoch + 1} | "
-              f"Train {avg_train_loss:.4f} | Eval {avg_eval_loss:.4f} | "
+        print(f"Epoch {epoch+1} | "
+              f"Train {avg_train:.4f} | Eval {avg_eval:.4f} | "
               f"R1 {r1:.4f} | R2 {r2:.4f} | RL {rL:.4f} | "
-              f"BS-F1 {bs_f1:.4f} | METEOR {met_score:.4f} | EntF1 {ent_f1:.4f}")
+              f"BS {bs_f1:.4f} | METEOR {met:.4f} | EntF1 {ent_f1:.4f}")
 
         wandb.log({
-            "epoch_train_loss": avg_train_loss,
-            "epoch_eval_loss":  avg_eval_loss,
-            "rouge1":           r1,
-            "rouge2":           r2,
-            "rougeL":           rL,
-            "bertscore_f1":     bs_f1,
-            "meteor":           met_score,
-            "entity_f1":        ent_f1,
-            "epoch":            epoch + 1,
+            "epoch/train_loss": avg_train, "epoch/eval_loss": avg_eval,
+            "epoch/rouge1": r1, "epoch/rouge2": r2, "epoch/rougeL": rL,
+            "epoch/bertscore_f1": bs_f1, "epoch/meteor": met,
+            "epoch/entity_f1": ent_f1, "epoch": epoch + 1,
         })
 
-        # ── Save checkpoint ──────────────────────────────────────────────────
-        save_dir  = "/tmp/uday/checkpoints"
+        # ── Checkpoint ────────────────────────────────────────────────────────
+        save_dir = "/tmp/uday/checkpoints"
         os.makedirs(save_dir, exist_ok=True)
-        ckpt_save = f"{save_dir}/gramformer_v2_epoch_{epoch + 1}.pt"
+        ckpt_ep = f"{save_dir}/dual_hyp_epoch_{epoch+1}.pt"
         torch.save({
-            "epoch":               epoch + 1,
-            "model_state_dict":    model.state_dict(),
+            "epoch":             epoch + 1,
+            "model_state_dict":  model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "train_loss":          avg_train_loss,
-            "eval_loss":           avg_eval_loss,
-            "rouge1":              r1,
-            "rouge2":              r2,
-        }, ckpt_save)
-        # Update "latest" pointer
-        torch.save({
-            "epoch":               epoch + 1,
-            "model_state_dict":    model.state_dict(),
-        }, ckpt_path)
-        print(f"✅ Checkpoint saved → {ckpt_save}")
+            "train_loss": avg_train, "eval_loss": avg_eval,
+            "rouge1": r1, "rouge2": r2, "rougeL": rL,
+            "bertscore_f1": bs_f1,
+        }, ckpt_ep)
+        torch.save({"epoch": epoch + 1, "model_state_dict": model.state_dict()},
+                   ckpt_latest)
+        print(f"  Checkpoint saved → {ckpt_ep}")
 
     wandb.finish()
     print("Training complete.")
