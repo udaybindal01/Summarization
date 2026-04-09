@@ -329,14 +329,35 @@ class MovieHypergraphDataset(Dataset):
         entity_mask[:n_valid] = True
 
         # Incidence matrix B [N, S]
+        # Incidence matrix B [N, S] - NOW USING HIERARCHICAL FLOAT ROLE WEIGHTS
         incidence = torch.zeros(N, S, dtype=torch.float)
         for s, scene in enumerate(scenes):
+            # Characters from the XML <character> tags
+            speakers = [c.upper() for c in scene.get("characters", [])]
+            triplets = scene.get("graph_triplets", [])
+            
             for name in self._scene_entities(scene):
                 if name in entity_to_idx:
-                    incidence[entity_to_idx[name], s] = 1.0
+                    n_idx = entity_to_idx[name]
+                    name_upper = name.upper()
+                    name_lower = name.lower()
+                    
+                    # Determine narrative hierarchy for the 3-Stream Graph
+                    if name_upper in speakers:
+                        weight = 1.0  # Main active speaker
+                    elif any(trip.lower().startswith(name_lower + "_") for trip in triplets):
+                        weight = 0.7  # Active subject in action (e.g., Joker_shoot_gun)
+                    elif any(trip.lower().endswith("_" + name_lower) for trip in triplets):
+                        weight = 0.5  # Passive object in action (e.g., Batman_punch_Joker)
+                    else:
+                        weight = 0.3  # Background presence / merely mentioned
+                        
+                    incidence[n_idx, s] = weight
 
-        # Hyperedge types [S]
-        edge_type_ids = torch.zeros(S, dtype=torch.long)
+        # Hyperedge types [S] - DEPRECATED BY LATENT EDGES
+        # We fill with 4 (NEUTRAL) to maintain backwards compatibility with the sum.py forward signature,
+        # but the model now dynamically generates latent edges ignoring this completely.
+        edge_type_ids = torch.full((S,), 4, dtype=torch.long)
         for s, scene in enumerate(scenes):
             htype = scene.get("hyperedge_type", "NEUTRAL")
             edge_type_ids[s] = HYPEREDGE_TYPE_MAP.get(htype, 4)
@@ -710,7 +731,8 @@ def train():
         ], weight_decay=0.01)
 
     optimizer = _make_optim()
-    scaler    = torch.cuda.amp.GradScaler()
+    # Updated for modern PyTorch to prevent deprecation spam
+    scaler    = torch.amp.GradScaler("cuda")
     wandb.watch(model, criterion, log="all", log_freq=50)
 
     total_steps  = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
@@ -764,7 +786,7 @@ def train():
             apply_lora(r=16, alpha=32)
             _set_stage2_grads()
             optimizer = _make_optim()
-            scaler    = torch.cuda.amp.GradScaler(enabled=False)
+            scaler    = torch.amp.GradScaler("cuda", enabled=False)
             s2_total  = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS_STAGE2
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer, num_warmup_steps=int(0.05 * s2_total),
