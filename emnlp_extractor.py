@@ -340,17 +340,23 @@ def main():
         print("Downloading MovieSum dataset...", flush=True)
         dataset = load_dataset("rohitsaxena/MovieSum", split="train")
         for ex in tqdm(dataset, desc="Building scene list (MovieSum)"):
-            scenes_list  = ex.get("screenplay", ex.get("scenes", ""))
+            # Safely check multiple possible keys
+            scenes_data  = ex.get("script", ex.get("screenplay", ex.get("scenes", "")))
             summary_text = ex.get("summary", "")
-            movie_id     = ex.get("name", ex.get("title", "movie"))
+            movie_id     = ex.get("name", ex.get("title", ex.get("movie_id", "movie")))
             
-            if isinstance(scenes_list, str) and len(scenes_list.strip()) > 10:
-                # SPLIT BY PROPER XML <scene> TAGS INSTEAD OF INT/EXT HEURISTIC
-                raw_scenes = re.findall(r'<scene>(.*?)</scene>', scenes_list, re.IGNORECASE | re.DOTALL)
+            # If the dataset returns a list of scenes, join them into a single string 
+            # so we can parse the XML structure cleanly
+            if isinstance(scenes_data, list):
+                scenes_data = "\n".join([str(s) for s in scenes_data])
+                
+            if isinstance(scenes_data, str) and len(scenes_data.strip()) > 10:
+                # SPLIT BY PROPER XML <scene> TAGS
+                raw_scenes = re.findall(r'<scene>(.*?)</scene>', scenes_data, re.IGNORECASE | re.DOTALL)
                 
                 # Fallback if the XML tags are missing for some reason
                 if not raw_scenes:
-                    raw_scenes = re.split(r"(?=(?:INT[.]|EXT[.])[ \t])", scenes_list)
+                    raw_scenes = re.split(r"(?=(?:INT[.]|EXT[.])[ \t])", scenes_data)
                     
                 for i, scene_txt in enumerate(raw_scenes):
                     if len(scene_txt.strip()) > 10:
