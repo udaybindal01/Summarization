@@ -47,6 +47,36 @@ _WRITE_EVERY     = 512
 _KEPT_ENTITY_TYPES = frozenset({"PERSON", "ORG", "GPE", "FACILITY", "PRODUCT"})
 
 # ---------------------------------------------------------------------------
+# Multiprocessing Worker Setup
+# ---------------------------------------------------------------------------
+_worker_nlp = None
+_worker_nlp_ner = None
+_worker_tokenizer = None
+
+def init_worker():
+    """Initializes spaCy and the tokenizer locally for each CPU worker."""
+    global _worker_nlp, _worker_nlp_ner, _worker_tokenizer
+    
+    # We suppress logging here so 10 workers don't spam the console
+    hf_logging.set_verbosity_error()
+    
+    _worker_nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat", "lemmatizer"])
+    _worker_nlp.max_length = _SPACY_MAX_CHARS + 200
+    
+    _worker_nlp_ner = spacy.load("en_core_web_sm", disable=["parser", "textcat", "lemmatizer"])
+    _worker_tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large")
+
+def process_scene_wrapper(scene_dict):
+    """Wrapper to unpack the dictionary and use the worker's local models."""
+    try:
+        return process_scene(
+            scene_dict["text"], scene_dict["summary"], scene_dict["id"],
+            _worker_nlp, _worker_nlp_ner, _worker_tokenizer, 512, 512
+        )
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
 # Screenplay Structural Parsers
 # ---------------------------------------------------------------------------
 
@@ -290,6 +320,8 @@ def process_scene(scene_xml, summary, scene_id,
 # ---------------------------------------------------------------------------
 
 def main():
+    import multiprocessing as mp
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--start",   type=int, default=0)
     parser.add_argument("--end",     type=int, default=-1)
@@ -299,15 +331,8 @@ def main():
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
-    print("Loading spaCy (parser pipeline, capped)...", flush=True)
-    nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat", "lemmatizer"])
-    nlp.max_length = _SPACY_MAX_CHARS + 200
-
-    print("Loading spaCy (NER + POS pipeline, full text)...", flush=True)
-    nlp_ner_pos = spacy.load("en_core_web_sm", disable=["parser", "textcat", "lemmatizer"])
-
-    print("Loading BART tokenizer...", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large")
+    # Note: We NO LONGER load spaCy or the tokenizer here in the main process.
+    # They are loaded inside init_worker() for each CPU core.
 
     print("Loading sentiment model on GPU...", flush=True)
     device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -316,10 +341,9 @@ def main():
     if device.type == "cuda":
         sent_model = sent_model.to(torch.bfloat16)
 
-    max_seq_len    = 512
-    max_target_len = 512
-    all_scenes     = []
+    all_scenes = []
 
+    # --- (Keep your existing dataset loading code here exactly as it is) ---
     if args.dataset == "mensa":
         print("Downloading MENSA dataset...", flush=True)
         dataset = load_dataset("rohitsaxena/MENSA", split="train")
@@ -340,21 +364,15 @@ def main():
         print("Downloading MovieSum dataset...", flush=True)
         dataset = load_dataset("rohitsaxena/MovieSum", split="train")
         for ex in tqdm(dataset, desc="Building scene list (MovieSum)"):
-            # Safely check multiple possible keys
             scenes_data  = ex.get("script", ex.get("screenplay", ex.get("scenes", "")))
             summary_text = ex.get("summary", "")
             movie_id     = ex.get("name", ex.get("title", ex.get("movie_id", "movie")))
             
-            # If the dataset returns a list of scenes, join them into a single string 
-            # so we can parse the XML structure cleanly
             if isinstance(scenes_data, list):
                 scenes_data = "\n".join([str(s) for s in scenes_data])
                 
             if isinstance(scenes_data, str) and len(scenes_data.strip()) > 10:
-                # SPLIT BY PROPER XML <scene> TAGS
                 raw_scenes = re.findall(r'<scene>(.*?)</scene>', scenes_data, re.IGNORECASE | re.DOTALL)
-                
-                # Fallback if the XML tags are missing for some reason
                 if not raw_scenes:
                     raw_scenes = re.split(r"(?=(?:INT[.]|EXT[.])[ \t])", scenes_data)
                     
@@ -365,36 +383,43 @@ def main():
                             "summary": summary_text,
                             "id": f"{movie_id}_Scene_{i:03d}",
                         })
+    # -----------------------------------------------------------------------
 
     end = args.end if args.end > 0 else len(all_scenes)
     all_scenes = all_scenes[args.start:end]
     print(f"Processing {len(all_scenes):,} scenes (indices {args.start}–{end})", flush=True)
 
+    # Leave one core free for the GPU/Main process
+    num_workers = max(1, mp.cpu_count() - 1)
+    print(f"Starting multiprocessing pool with {num_workers} CPU workers...", flush=True)
+
     written = 0
     buffer  = []
 
     with gzip.open(args.out, "wt", encoding="utf-8") as out_f:
-        for scene in tqdm(all_scenes, desc="Extracting", unit="scene"):
-            try:
-                pre = process_scene(
-                    scene["text"], scene["summary"], scene["id"],
-                    nlp, nlp_ner_pos, tokenizer, max_seq_len, max_target_len,
-                )
-                buffer.append(pre)
-            except Exception:
-                continue
+        # Launch the multiprocessing pool
+        with mp.Pool(processes=num_workers, initializer=init_worker) as pool:
+            
+            # imap_unordered is incredibly fast because it yields results as soon as any worker finishes
+            iterator = pool.imap_unordered(process_scene_wrapper, all_scenes, chunksize=32)
+            
+            for pre in tqdm(iterator, total=len(all_scenes), desc="Extracting", unit="scene"):
+                if pre is not None:
+                    buffer.append(pre)
 
-            if len(buffer) >= _WRITE_EVERY:
+                # Once we hit 512, pause the main loop to run the GPU sentiment batch
+                if len(buffer) >= _WRITE_EVERY:
+                    for rec in attach_emotions(buffer, sent_tok, sent_model, device):
+                        out_f.write(json.dumps(rec) + "\n")
+                        written += 1
+                    buffer = []
+                    out_f.flush()
+
+            # Flush remaining items
+            if buffer:
                 for rec in attach_emotions(buffer, sent_tok, sent_model, device):
                     out_f.write(json.dumps(rec) + "\n")
                     written += 1
-                buffer = []
-                out_f.flush()
-
-        if buffer:
-            for rec in attach_emotions(buffer, sent_tok, sent_model, device):
-                out_f.write(json.dumps(rec) + "\n")
-                written += 1
 
     print(f"\nDone — {written:,} scenes → {args.out}")
 
