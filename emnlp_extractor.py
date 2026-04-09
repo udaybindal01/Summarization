@@ -390,7 +390,8 @@ def main():
     print(f"Processing {len(all_scenes):,} scenes (indices {args.start}–{end})", flush=True)
 
     # Leave one core free for the GPU/Main process
-    num_workers = max(1, mp.cpu_count() - 1)
+    # num_workers = max(1, mp.cpu_count() - 1)
+    num_workers = min(16, max(1, mp.cpu_count() - 1))
     print(f"Starting multiprocessing pool with {num_workers} CPU workers...", flush=True)
 
     written = 0
@@ -398,8 +399,8 @@ def main():
 
     with gzip.open(args.out, "wt", encoding="utf-8") as out_f:
         # Launch the multiprocessing pool
-        with mp.Pool(processes=num_workers, initializer=init_worker) as pool:
-            
+
+        with mp.Pool(processes=num_workers, initializer=init_worker, maxtasksperchild=50) as pool:
             # imap_unordered is incredibly fast because it yields results as soon as any worker finishes
             iterator = pool.imap_unordered(process_scene_wrapper, all_scenes, chunksize=32)
             
