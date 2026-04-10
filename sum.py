@@ -81,17 +81,21 @@ class MambaLayer(nn.Module):
         x_act    = F.silu(x_conv)
         x_ssm              = self.x_proj(x_act)
         delta, B_mat, C    = torch.split(x_ssm, [1, self.d_state, self.d_state], dim=-1)
-        delta              = F.softplus(self.dt_proj(delta).float())
-        B_mat, C           = B_mat.float(), C.float()
-        x_act_f32          = x_act.float()
+        # Keep delta/B/C in native dtype (BF16 under autocast) — only h stays FP32
+        # for SSM recurrence numerical stability over long sequences.
+        delta    = F.softplus(self.dt_proj(delta)).float()   # [B, T, d_inner] FP32
+        B_mat    = B_mat.float()                             # [B, T, d_state]
+        C        = C.float()                                 # [B, T, d_state]
+        x_act_f32 = x_act.float()                           # [B, T, d_inner]
         h = torch.zeros(batch, self.d_inner, self.d_state, device=x.device, dtype=torch.float32)
-        outs = []
+        # Pre-allocate output tensor — eliminates seq_len individual heap allocations
+        # (the outs-list pattern created 256×[B,d_inner] tensors, fragmenting GPU memory).
+        y = torch.zeros(batch, seq_len, self.d_inner, device=x.device, dtype=torch.float32)
         for t in range(seq_len):
             h = h * torch.exp(-delta[:, t].unsqueeze(-1)) + \
                 (B_mat[:, t].unsqueeze(1) * x_act_f32[:, t].unsqueeze(-1))
-            outs.append((h * C[:, t].unsqueeze(1)).sum(dim=-1))
-        y = torch.stack(outs, dim=1)
-        return self.out_proj(y * F.silu(z)) + residual
+            y[:, t, :] = (h * C[:, t].unsqueeze(1)).sum(dim=-1)
+        return self.out_proj(y.to(x.dtype) * F.silu(z)) + residual
 
 class MambaBlock(nn.Module):
     def __init__(self, d_model, d_state, d_conv, num_layers=4):
@@ -540,7 +544,7 @@ class DualTowerHypergraphSummariser(nn.Module):
         self.post_scan_adapter = PostScanCrossAttentionAdapter(d_model)
         self.pointer_head = HierarchicalPointerHeadV2(d_model, vocab_size)
         self.memory_norm  = nn.LayerNorm(d_model)
-        self.use_checkpointing = False
+        self.use_checkpointing = True
 
     def enable_gradient_checkpointing(self):
         self.use_checkpointing = True
@@ -548,7 +552,7 @@ class DualTowerHypergraphSummariser(nn.Module):
     def _text_tower(self, input_ids, action_mask, dial_mask, ent_mask, head_mask):
         B, S, L = input_ids.shape
         pad_id   = 1
-        chunk_sz = 32
+        chunk_sz = 8   # reduced from 32 — each Mamba state is [chunk_sz, d_inner, d_state] FP32
         local_feats = []
         
         for i in range(0, S, chunk_sz):
