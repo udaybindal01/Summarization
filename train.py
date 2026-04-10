@@ -41,6 +41,7 @@ import torch._dynamo
 torch._dynamo.config.cache_size_limit = 512
 os.environ["USE_TORCH"] = "1"
 os.environ["TMPDIR"]    = "/tmp/uday"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 sys.path.insert(0, "/tmp/uday/lib")
 
 from peft import LoraConfig, get_peft_model
@@ -565,7 +566,23 @@ def train():
 
     # ── 1. Dataset selection ─────────────────────────────────────────────────
     src_path = MOVIESUM_JSONL if ABLATION["dataset"] in ("moviesum", "both") else MENSA_JSONL
-    if not (os.path.exists(TRAIN_SPLIT_PATH) and os.path.exists(EVAL_SPLIT_PATH)):
+
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(
+            f"Source dataset not found: {src_path}\n"
+            f"Run: python emnlp_extractor.py --dataset "
+            f"{'moviesum' if 'moviesum' in src_path else 'mensa'} --out {src_path}"
+        )
+
+    # Regenerate splits if they don't exist OR if the source file is newer than them
+    # (catches the "stale splits from a previous tiny run" failure mode)
+    src_mtime = os.path.getmtime(src_path)
+    splits_stale = not (
+        os.path.exists(TRAIN_SPLIT_PATH) and os.path.exists(EVAL_SPLIT_PATH)
+        and os.path.getmtime(TRAIN_SPLIT_PATH) >= src_mtime
+        and os.path.getmtime(EVAL_SPLIT_PATH)  >= src_mtime
+    )
+    if splits_stale:
         split_dataset_by_movie(src_path, TRAIN_SPLIT_PATH, EVAL_SPLIT_PATH,
                                num_train=NUM_TRAIN_MOVIES)
 
@@ -693,10 +710,13 @@ def train():
         print(f"LoRA applied: r={r}, alpha={alpha}")
 
     def _set_stage1_grads():
-        """Stage 1: freeze RoBERTa + Mamba + adapter; train hypergraph + decoder cross-attn."""
+        """Stage 1: freeze RoBERTa + Mamba + pos-embed + adapter; train hypergraph + decoder cross-attn.
+        scene_pos_embed feeds directly into frozen Mamba — must be co-frozen to prevent NaN divergence.
+        """
         for name, p in model.named_parameters():
             p.requires_grad = not any(s in name for s in
-                                      ["roberta", "mamba_tower", "post_scan_adapter"])
+                                      ["roberta", "mamba_tower", "scene_pos_embed",
+                                       "post_scan_adapter"])
 
     def _set_stage2_grads():
         """Stage 2: freeze RoBERTa only; LoRA on Mamba; train everything else including adapter."""
@@ -739,7 +759,7 @@ def train():
         return AdamW([
             {"params": other_p,   "lr": LR_NEW_LAYERS},
             {"params": lora_p,    "lr": LR_LORA},
-            {"params": adapter_p, "lr": LR_NEW_LAYERS * 5},  # 5× for randomly-initialized adapter
+            {"params": adapter_p, "lr": LR_NEW_LAYERS * 2},  # 2× for randomly-initialized adapter (5× caused NaN)
         ], weight_decay=0.01)
 
     optimizer = _make_optim()
@@ -795,6 +815,7 @@ def train():
         # Stage transition at epoch EPOCHS_STAGE1
         if epoch == EPOCHS_STAGE1 and not lora_applied:
             print("→ Stage 2: applying LoRA to Mamba tower")
+            torch.cuda.empty_cache()   # release Stage-1 fragmentation before LoRA expands memory
             apply_lora(r=16, alpha=32)
             _set_stage2_grads()
             optimizer = _make_optim()

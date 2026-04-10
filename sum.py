@@ -279,7 +279,9 @@ class HierarchicalPointerHeadV2(nn.Module):
         context   = torch.matmul(scene_attn, scene_memory)             
         p_gen     = torch.sigmoid((self.p_gen_linear(torch.cat([decoder_states, context], dim=-1)) - 0.5) * 10.0)
 
-        scene_to_token = torch.zeros(B, S, self.vocab_size, device=device)
+        # Use the same dtype as decoder_states (BF16 under autocast) to avoid a [B,S,V] FP32 allocation
+        scene_to_token = torch.zeros(B, S, self.vocab_size, device=device,
+                                     dtype=decoder_states.dtype)
 
         if triplets and tokenizer is not None:
             dec_last = decoder_states[:, -1, :]
@@ -456,12 +458,12 @@ class PostScanCrossAttentionAdapter(nn.Module):
         self.norm_scene_2 = nn.LayerNorm(d_model)
         self.norm_node_2  = nn.LayerNorm(d_model)
         self.ff_scene = nn.Sequential(
-            nn.Linear(d_model, d_model * 4), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model), nn.Dropout(dropout),
+            nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model), nn.Dropout(dropout),
         )
         self.ff_node = nn.Sequential(
-            nn.Linear(d_model, d_model * 4), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model), nn.Dropout(dropout),
+            nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model), nn.Dropout(dropout),
         )
 
     def forward(self, H_scenes, H_nodes, entity_mask):
@@ -599,8 +601,15 @@ class DualTowerHypergraphSummariser(nn.Module):
         gate         = self.fusion_gate(torch.cat([H_text, H_hyperedges], dim=-1))
         fused_scenes = self.fusion_norm(gate * H_text + (1 - gate) * H_hyperedges)
 
-        # Fix 3: bidirectional cross-attention adapter before decoder fusion
-        fused_scenes, H_nodes = self.post_scan_adapter(fused_scenes, H_nodes, entity_mask)
+        # Fix 3: bidirectional cross-attention adapter before decoder fusion.
+        # Checkpoint it in Stage 2 so its activations are recomputed rather than stored.
+        if self.use_checkpointing and target_ids is not None:
+            fused_scenes, H_nodes = checkpoint(
+                self.post_scan_adapter, fused_scenes, H_nodes, entity_mask,
+                use_reentrant=False,
+            )
+        else:
+            fused_scenes, H_nodes = self.post_scan_adapter(fused_scenes, H_nodes, entity_mask)
 
         valid_nodes    = entity_mask.unsqueeze(-1).float() * H_nodes
         aligned_memory = torch.cat([fused_scenes, valid_nodes], dim=1)
@@ -624,19 +633,21 @@ class DualTowerHypergraphSummariser(nn.Module):
                 input_ids=shifted_targets, attention_mask=tgt_attn_mask,
                 encoder_hidden_states=aligned_memory, encoder_attention_mask=enc_attn_mask,
             )
-            dec_hidden    = decoder_out.last_hidden_state               
-            vocab_logits  = self.head(dec_hidden).float()
+            dec_hidden    = decoder_out.last_hidden_state
+            # Keep in autocast dtype (BF16) until the very end — three ~50 MB vocab tensors
+            # materialised in FP32 was the direct cause of OOM at Stage 2.
+            vocab_logits  = self.head(dec_hidden)
 
             if triplets is not None and self.tokenizer is not None:
-                vocab_probs    = F.softmax(vocab_logits, dim=-1)
+                vocab_probs    = F.softmax(vocab_logits, dim=-1)           # BF16 ~25 MB
                 p_gen, ptr_pr  = self.pointer_head(
                     dec_hidden, fused_scenes, triplets, self.tokenizer, self.head.weight, input_ids.device
                 )
-                final_probs = p_gen * vocab_probs + (1 - p_gen) * ptr_pr
+                final_probs = p_gen * vocab_probs + (1 - p_gen) * ptr_pr  # BF16 ~25 MB
                 final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                final_log_probs = torch.log(final_probs + 1e-8)
+                final_log_probs = torch.log(final_probs.float() + 1e-8)   # cast FP32 only here
             else:
-                final_log_probs = F.log_softmax(vocab_logits, dim=-1)
+                final_log_probs = F.log_softmax(vocab_logits.float(), dim=-1)
 
             return final_log_probs, H_text_4d, labels, dec_hidden, H_hyperedges
         else:
