@@ -428,6 +428,68 @@ class RelationalEventConsistencyLoss(nn.Module):
         return total
 
 # =============================================================================
+# 6b. Post-Scan Cross-Attention Adapter (Fix 3)
+# =============================================================================
+
+class PostScanCrossAttentionAdapter(nn.Module):
+    """
+    Fix 3: Post-scan cross-attention adapter.
+    Runs parallel cross-attention between the completed scene sequence and the
+    final entity node states so each side is mutually aware before decoder fusion.
+
+    Cross 1: scenes query nodes  → each scene embedding absorbs final character states.
+    Cross 2: nodes query scenes  → each entity node absorbs full narrative context.
+
+    Both operations use Pre-LayerNorm + residual + FFN (standard transformer block).
+    Frozen in Stage 1; trained at 5× LR from Stage 2 (random init must catch up).
+    """
+    def __init__(self, d_model, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.norm_scene_1 = nn.LayerNorm(d_model)
+        self.norm_node_1  = nn.LayerNorm(d_model)
+
+        self.attn_scene_to_node = nn.MultiheadAttention(
+            d_model, num_heads, batch_first=True, dropout=dropout)
+        self.attn_node_to_scene = nn.MultiheadAttention(
+            d_model, num_heads, batch_first=True, dropout=dropout)
+
+        self.norm_scene_2 = nn.LayerNorm(d_model)
+        self.norm_node_2  = nn.LayerNorm(d_model)
+        self.ff_scene = nn.Sequential(
+            nn.Linear(d_model, d_model * 4), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model), nn.Dropout(dropout),
+        )
+        self.ff_node = nn.Sequential(
+            nn.Linear(d_model, d_model * 4), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model), nn.Dropout(dropout),
+        )
+
+    def forward(self, H_scenes, H_nodes, entity_mask):
+        norm_s = self.norm_scene_1(H_scenes)
+        norm_n = self.norm_node_1(H_nodes)
+
+        # True = ignore (PyTorch MHA convention)
+        key_pad_nodes = ~entity_mask
+
+        # Cross 1: scenes attend to nodes
+        s_star, _ = self.attn_scene_to_node(
+            query=norm_s, key=norm_n, value=norm_n,
+            key_padding_mask=key_pad_nodes,
+        )
+        H_scenes = H_scenes + s_star
+        H_scenes = H_scenes + self.ff_scene(self.norm_scene_2(H_scenes))
+
+        # Cross 2: nodes attend to scenes
+        n_star, _ = self.attn_node_to_scene(
+            query=norm_n, key=norm_s, value=norm_s,
+        )
+        H_nodes = H_nodes + n_star
+        H_nodes = H_nodes + self.ff_node(self.norm_node_2(H_nodes))
+
+        return H_scenes, H_nodes
+
+
+# =============================================================================
 # 7. Main model — DualTowerHypergraphSummariser
 # =============================================================================
 
@@ -447,6 +509,12 @@ class DualTowerHypergraphSummariser(nn.Module):
 
         self.scene_proj = (nn.Linear(768, d_model, bias=False) if d_model != 768 else nn.Identity())
         self.mamba_tower = MambaBlock(d_model, d_state=64, d_conv=4, num_layers=num_layers)
+
+        # Fix 4: Scene-level positional embeddings (indexed by scene position in film)
+        self.scene_pos_embed = nn.Embedding(512, d_model)
+        nn.init.normal_(self.scene_pos_embed.weight, mean=0.0, std=0.02)
+        self.scene_pos_drop  = nn.Dropout(0.1)
+
         self.raft = RaftConsensusAttentionV2(d_model=d_model, num_heads=4)
 
         # ── Tower 2 ───────────────────────────────────────────────────────
@@ -466,6 +534,8 @@ class DualTowerHypergraphSummariser(nn.Module):
         for name, p in self.bart_decoder.named_parameters():
             if "encoder_attn" in name: p.requires_grad = True
 
+        # Fix 3: Post-scan cross-attention adapter (before pointer head)
+        self.post_scan_adapter = PostScanCrossAttentionAdapter(d_model)
         self.pointer_head = HierarchicalPointerHeadV2(d_model, vocab_size)
         self.memory_norm  = nn.LayerNorm(d_model)
         self.use_checkpointing = False
@@ -480,12 +550,22 @@ class DualTowerHypergraphSummariser(nn.Module):
         local_feats = []
         
         for i in range(0, S, chunk_sz):
-            j     = min(i + chunk_sz, S)
+            j         = min(i + chunk_sz, S)
+            chunk_len = j - i
             c_ids = input_ids[:, i:j].contiguous().view(-1, L)
             c_att = (c_ids != pad_id).long()
             with torch.no_grad():
                 c_rob = self.roberta(c_ids, attention_mask=c_att).last_hidden_state
             c_emb = self.scene_proj(c_rob)
+
+            # Fix 4: add learned scene-position embeddings before Mamba
+            scene_ids = torch.arange(i, j, device=input_ids.device)
+            pos_embs  = self.scene_pos_embed(scene_ids)              # [chunk_len, D]
+            c_emb = c_emb.view(B, chunk_len, L, self.d_model)
+            c_emb = c_emb + pos_embs.unsqueeze(0).unsqueeze(2)      # broadcast [1, chunk_len, 1, D]
+            c_emb = self.scene_pos_drop(c_emb)
+            c_emb = c_emb.view(B * chunk_len, L, self.d_model)
+
             if self.use_checkpointing:
                 c_out = checkpoint(self.mamba_tower, c_emb, use_reentrant=False)
             else:
@@ -519,8 +599,11 @@ class DualTowerHypergraphSummariser(nn.Module):
         gate         = self.fusion_gate(torch.cat([H_text, H_hyperedges], dim=-1))
         fused_scenes = self.fusion_norm(gate * H_text + (1 - gate) * H_hyperedges)
 
-        valid_nodes    = entity_mask.unsqueeze(-1).float() * H_nodes   
-        aligned_memory = torch.cat([fused_scenes, valid_nodes], dim=1) 
+        # Fix 3: bidirectional cross-attention adapter before decoder fusion
+        fused_scenes, H_nodes = self.post_scan_adapter(fused_scenes, H_nodes, entity_mask)
+
+        valid_nodes    = entity_mask.unsqueeze(-1).float() * H_nodes
+        aligned_memory = torch.cat([fused_scenes, valid_nodes], dim=1)
         aligned_memory = self.memory_norm(aligned_memory)
 
         if target_ids is not None:

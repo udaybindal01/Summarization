@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is **GraM-Former v2** — a graph-augmented transformer model for screenplay/movie summarization. It processes movies scene-by-scene, builds graph representations, and generates summaries using a BART-based encoder-decoder with custom Mamba-style scene encoding.
+This is a **Dual-Tower Dynamic Hypergraph Summariser (v3)** for screenplay/movie summarization. It processes movies scene-by-scene, builds a dynamic hypergraph over entity states, and generates summaries using a BART-based decoder fused with Mamba-style scene encoding.
+
+Primary dataset: **MovieSum** (~2,200 movies). Secondary: **MENSA** (~500 movies). MovieSum-trained models are also evaluated zero-shot on MENSA.
 
 ## Pipeline Stages
 
@@ -12,94 +14,129 @@ This is **GraM-Former v2** — a graph-augmented transformer model for screenpla
 Converts raw MENSA/MovieSum HuggingFace datasets into compressed JSONL feature files.
 
 ```bash
-# Extract MENSA training data (supports sharding with --start/--end)
 python emnlp_extractor.py --dataset mensa --out /tmp/uday/mensa_train_data.jsonl.gz
-
-# Extract a slice (for parallel runs)
-python emnlp_extractor.py --start 0 --end 5000 --out /tmp/uday/shard_0.jsonl.gz
-
-# Extract MovieSum
 python emnlp_extractor.py --dataset moviesum --out /tmp/uday/moviesum_data.jsonl.gz
+python emnlp_extractor.py --start 0 --end 5000 --out /tmp/uday/shard_0.jsonl.gz  # sharded
 ```
 
 ### 2. Training (`train.py`)
 ```bash
-# Full model training
+# Full model training (MovieSum by default)
 python train.py --run_name full_model
 
-# Ablation experiments (disable individual graph components)
-python train.py --run_name ablation_no_causal    --no_causal_graph
-python train.py --run_name ablation_no_charstate --no_char_state_graph
-python train.py --run_name ablation_no_cooccur   --no_char_cooccur_graph
-python train.py --run_name ablation_no_coherence --no_coherence_loss
-python train.py --run_name ablation_single_graph --single_binary_graph
+# Ablation flags
+python train.py --run_name ablation_no_hypergraph   --no_hypergraph       # text-only baseline
+python train.py --run_name ablation_static          --static_hypergraph   # DiscoGraMS-style baseline
+python train.py --run_name ablation_no_gru          --no_gru              # EMA instead of GRU updates
+python train.py --run_name ablation_no_raft         --no_raft             # no cross-modal fusion
+python train.py --run_name ablation_no_pointer      --no_pointer_head
+python train.py --run_name ablation_no_coherence    --no_coherence_loss
+python train.py --run_name ablation_no_contrastive  --no_contrastive_loss
+python train.py --run_name discograms_baseline      --static_hypergraph --no_gru  # paper baseline
 
 # Key flags
 --d_model 1024          # must match BART variant (1024=large, 768=base)
+--num_layers 4          # number of MambaBlock layers
 --entity_penalty 3.0    # weight for entity consistency loss term
---dataset mensa|moviesum|both
+--dataset moviesum|mensa|both
 ```
 
-Checkpoints are saved to `/tmp/uday/checkpoints/` (RAM disk for speed).
+Checkpoints: `/tmp/uday/checkpoints/`. Split files: `/tmp/uday/train_{run_name}.jsonl` and `eval_{run_name}.jsonl`.
 
 ### 3. Inference (`inference.py`)
 ```bash
 python inference.py
 # Edit CHECKPOINT_PATH inside main() to point to the desired checkpoint
-# Reads test data from /tmp/uday/mensa_test_data.jsonl.gz
 ```
 
 ### 4. Evaluation (`eval.py`)
-Standalone triplet extraction evaluation (precision/recall/F1 for graph edges):
+Standalone triplet extraction evaluation (precision/recall/F1):
 ```bash
 python eval.py
 ```
 
+### 5. Visualization (`visualize_graph.py`)
+Utility for visualizing the movie hypergraph as a bipartite graph (entities ↔ scenes):
+```python
+from visualize_graph import plot_movie_hypergraph
+plot_movie_hypergraph(incidence_matrix, entity_names, movie_name="...", save_path="out.png")
+```
+
 ## Architecture (`sum.py`)
 
-**GraMFormerV2** is the main model class. Key components:
+**`DualTowerHypergraphSummariser`** is the main model class with two towers fused via cross-attention.
 
-- **RoBERTa (frozen) → `scene_proj` → MambaLayer**: Scene-level encoder pipeline. Frozen `roberta-base` (768d) provides contextual token reps. `scene_proj` bridges 768→d_model (identity if d_model=768). `MambaLayer` is a clean selective SSM — no token-level graph routing (the old dependency-parse graph routing was removed: it caused O(seq²) OOM and added noise from poor spaCy accuracy on screenplay text). LoRA (Stage 2) targets: `in_proj`, `x_proj`, `out_proj`, `dt_proj`. RoBERTa stays frozen throughout.
-- **HeterogeneousGraphTransformer (HGT)**: Fuses **three** typed movie-level adjacency matrices via type-aware Q/K/V attention (3 edge types). Edge types: (0) causal event graph — directed SVO chains with entity canonicalization and stop-entity filtering; (1) character state graph — weighted by emotion-polarity delta for shared characters; (2) character co-occurrence graph — Jaccard similarity of canonical character sets per scene (built from screenplay ALL-CAPS speaker tags + SVO subjects).
-- **RaftConsensusAttentionV2**: Cross-modal attention across 4 modalities (action, dialogue, entity, header), with gated fusion and Riemannian orthogonality penalty.
-- **DynamicGraphModulator v2**: IDF-weighted edge pruning on entity co-occurrence graphs.
-- **HierarchicalPointerHead v2**: Dual-level copy mechanism (scene attention + entity salience).
-- **Losses**: `RelationalEventConsistencyLoss` (label-smoothed entity NLL) + `NarrativeCoherenceLoss` (scene-pair NT-Xent over encoder scene reps; positive pairs = scenes sharing a causal edge within the movie).
+### Tower 1 — Text Stream
+`Frozen RoBERTa (768d) → scene_proj (768→d_model) → MambaBlock → RaftConsensusAttentionV2`
 
-BART backbone: defaults to `facebook/bart-large` (d_model=1024). Can switch to `facebook/bart-base` (d_model=768) via `--bart_model` flag. Local path `/tmp/uday/bart-large` is checked first to avoid network access. Tokenizer defaults to `bart_model` but can be set independently via `--bart_tokenizer`. The extraction pipeline (`emnlp_extractor.py`) and dataset loader both use the BART tokenizer to ensure decoder start token semantics match (C1/C2).
+- **MambaBlock**: Stack of `num_layers` selective SSM layers with no token-level graph routing (removed in v2 due to O(seq²) OOM).
+- **RaftConsensusAttentionV2**: Cross-modal attention across 4 modalities (action, dialogue, entity, header) with gated consensus fusion. Output: `H_text [B, S, L, d_model]`.
+- LoRA (Stage 2) targets Mamba's `in_proj`, `x_proj`, `out_proj`, `dt_proj`. RoBERTa is always frozen.
 
-## Data Format (`mensa.py` / JSONL)
+### Tower 2 — Dynamic 3-Stream Hypergraph (DHEG)
+`DynamicHypergraphTower` processes entities sequentially across scenes using an incidence matrix with **float role weights** (not binary):
+- `1.0` = active speaker, `0.7` = SVO subject, `0.5` = SVO object, `0.3` = background mention
 
-Each line in the `.jsonl.gz` files is a single scene with:
+Three message streams per scene, fused via learnable softmax weights:
+1. **Scene stream**: What is happening in this scene (from latent hyperedge).
+2. **Arc stream**: Historical context from past scenes sharing these entities (temporal decay).
+3. **Interaction stream**: Social context from co-occurring entities (role-weighted co-occurrence).
+
+Entity states updated via `GRUCell` only for entities present in the current scene. `edge_type_ids` (hardcoded `NEUTRAL`) are kept for API compatibility but **ignored** — edges are fully latent.
+
+### Fusion
+Deep cross-attention over `[H_text_pooled, H_hyperedges, h_entities]` → BART decoder.
+
+### Losses
+- `RelationalEventConsistencyLoss`: label-smoothed entity NLL, weighted by `--entity_penalty`.
+- `NarrativeCoherenceLoss`: scene-pair NT-Xent where positive pairs = scenes with Jaccard similarity > 0.25 in the incidence matrix (entities in common).
+
+## Data Format
+
+Each line in `.jsonl.gz` files is a single scene:
 - `movie_id`: `"MovieName_Scene_NNN"`
-- `input_ids`, `target_ids`: RoBERTa-tokenized, padded to `max_seq_len=512`
-- `adjacency_matrix`: token-level dependency graph `[512×512]` as int8
+- `input_ids`, `target_ids`: RoBERTa-tokenized, padded to `max_seq_len` (256 in v3, was 512)
 - `action_mask`, `dialogue_mask`, `entity_mask`, `header_mask`: 4-way modality masks (bool)
 - `graph_triplets`: list of `"Subject_Verb_Object"` strings (negation prefixed with `"NOT "`)
+- `characters`: speaker names from screenplay ALL-CAPS tags
+- `ner_entities`: list of `{text, type}` dicts (NER output)
+- `hyperedge_type`: dominant scene type string (deprecated; model uses latent edges)
+- `character_emotions`: dict of character → float polarity
 - `scene_meta`: `{dialogue_density, action_density, has_int, has_ext}`
-- `character_emotions`: dict of character → float polarity score
 
-Movies are grouped in the collate function (`movie_collate_fn` in `train.py`) into batches where each batch is one movie (variable number of scenes).
+**`MovieHypergraphDataset`** groups scenes by movie and builds per-movie tensors:
+- `incidence_matrix [MAX_ENTITIES=100, MAX_SCENES=64]` float — role-weighted
+- `entity_type_ids [100]` long — from `ENTITY_TYPE_MAP` (PERSON/ORG/GPE/FACILITY/OTHER)
+- `edge_type_ids [64]` long — legacy; always `NEUTRAL` (4)
+- `entity_mask [100]` bool
 
-`MensaGraphDataset` requires **uncompressed** `.jsonl` split files — it uses byte-offset seeking for O(1) random access and constant ~50 MB RAM regardless of dataset size. The source `mensa_train_data.jsonl.gz` stays compressed; `split_dataset_by_movie()` inflates it into per-split plain `.jsonl` files (expect ~55 GB train + ~10 GB eval on `/tmp`). If you see a `ValueError` about `.gz` files, delete any old `.gz` split files and re-run training.
+Entity registry priority per scene: NER entities > speaker names > SVO subjects/objects. Movies with >64 scenes are stride-sampled.
+
+**`SceneDataset`** requires **uncompressed** `.jsonl` — uses byte-offset seeking for O(1) random access. The source `.jsonl.gz` stays compressed; `split_dataset_by_movie()` inflates it into per-split plain `.jsonl` files. If you see a `ValueError` about `.gz` files, delete old `.gz` split files and re-run.
 
 ## Key Paths (hardcoded)
 
 | Path | Purpose |
 |------|---------|
-| `/tmp/uday/` | Main data directory |
-| `/tmp/uday/` | RAM disk — checkpoints, fast I/O |
-| `/tmp/uday/bart-large` | Local BART-large weights |
-| `/tmp/uday/mensa_train_data.jsonl.gz` | Extracted train features |
-| `/tmp/uday/mensa_test_data.jsonl.gz` | Extracted test features |
+| `/tmp/uday/` | Main data and checkpoints directory |
+| `/tmp/uday/bart-large` | Local BART-large weights (checked before HF hub) |
+| `/tmp/uday/moviesum_data.jsonl.gz` | Primary training data |
+| `/tmp/uday/mensa_train_data.jsonl.gz` | Secondary training data |
+| `/tmp/uday/mensa_test_data.jsonl.gz` | Test data |
 | `/tmp/uday/checkpoints/` | Model checkpoints |
+
+## Training Stages
+
+- **Stage 1** (2 epochs): RoBERTa + Mamba frozen; train hypergraph tower + decoder. LR=1e-4.
+- **Stage 2** (20 epochs): LoRA on Mamba; full model except frozen RoBERTa. LR=1e-5.
+- Evaluation every epoch: ROUGE + BERTScore + METEOR + entity F1.
 
 ## Dependencies
 
-Core: `torch`, `transformers`, `peft` (LoRA), `spacy` + `en_core_web_sm`, `fastcoref`, `datasets`, `wandb`, `evaluate`, `tqdm`, `matplotlib`, `seaborn`
+Core: `torch`, `transformers`, `peft` (LoRA), `spacy` + `en_core_web_sm`, `fastcoref`, `datasets`, `wandb`, `evaluate`, `tqdm`, `matplotlib`, `seaborn`, `networkx`
 
 Sentiment model: `cardiffnlp/twitter-roberta-base-sentiment-latest`
 
 ## Ablation System
 
-All components in `sum.py` are ablation-switchable via `ABLATION` dict in `train.py`. Each `--no_*` flag disables one architectural component. Use `--run_name` to distinguish W&B runs and output split files.
+All components are ablation-switchable via `ABLATION` dict in `train.py`. Each `--no_*` / `--static_*` flag disables one component. Use `--run_name` to distinguish W&B runs and output split files. Stream weight logs (`stream_weight/scene`, `stream_weight/arc`, `stream_weight/interaction`) in W&B show which hypergraph streams the model relies on.

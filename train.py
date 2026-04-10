@@ -58,6 +58,7 @@ from sum import (
     NUM_HYPEREDGE_TYPES,
     NUM_ENTITY_TYPES,
 )
+from visualize_graph import log_hypergraph_to_wandb
 
 torch.set_float32_matmul_precision("high")
 
@@ -362,6 +363,11 @@ class MovieHypergraphDataset(Dataset):
             htype = scene.get("hyperedge_type", "NEUTRAL")
             edge_type_ids[s] = HYPEREDGE_TYPE_MAP.get(htype, 4)
 
+        # Invert entity_to_idx to get ordered name list for visualization
+        entity_names = [""] * N
+        for name, idx in entity_to_idx.items():
+            entity_names[idx] = name
+
         result = {
             "movie_name":       movie_name,
             "scenes":           scenes,
@@ -369,6 +375,7 @@ class MovieHypergraphDataset(Dataset):
             "edge_type_ids":    edge_type_ids,   # [S]
             "entity_type_ids":  entity_type_ids, # [N]
             "entity_mask":      entity_mask,     # [N]
+            "entity_names":     entity_names,    # List[str] length N, "" = padding
         }
         self._cache[movie_name] = result
         return result
@@ -437,6 +444,8 @@ def hypergraph_collate_fn(batch):
         "entity_type_ids":  entity_type_ids,
         "entity_mask":      entity_mask_b,
         "triplets":         all_triplets,
+        "movie_name":       [item["movie_name"] for item in batch],
+        "entity_names":     [item.get("entity_names", []) for item in batch],
     }
 
 
@@ -684,13 +693,13 @@ def train():
         print(f"LoRA applied: r={r}, alpha={alpha}")
 
     def _set_stage1_grads():
-        """Stage 1: freeze RoBERTa + Mamba; train hypergraph + decoder cross-attn."""
+        """Stage 1: freeze RoBERTa + Mamba + adapter; train hypergraph + decoder cross-attn."""
         for name, p in model.named_parameters():
             p.requires_grad = not any(s in name for s in
-                                      ["roberta", "mamba_tower"])
+                                      ["roberta", "mamba_tower", "post_scan_adapter"])
 
     def _set_stage2_grads():
-        """Stage 2: freeze RoBERTa only; LoRA on Mamba; train everything else."""
+        """Stage 2: freeze RoBERTa only; LoRA on Mamba; train everything else including adapter."""
         for name, p in model.named_parameters():
             if "roberta" in name:
                 p.requires_grad = False
@@ -699,7 +708,7 @@ def train():
             elif "head." in name:
                 p.requires_grad = False
             else:
-                p.requires_grad = True
+                p.requires_grad = True  # covers post_scan_adapter, hypergraph, raft, etc.
 
     if start_epoch >= EPOCHS_STAGE1:
         apply_lora(r=64, alpha=128)
@@ -721,18 +730,21 @@ def train():
 
     # ── 7. Optimiser ──────────────────────────────────────────────────────────
     def _make_optim():
-        lora_p  = [p for n, p in model.named_parameters()
-                   if p.requires_grad and "lora_" in n]
-        other_p = [p for n, p in model.named_parameters()
-                   if p.requires_grad and "lora_" not in n]
+        lora_p    = [p for n, p in model.named_parameters()
+                     if p.requires_grad and "lora_" in n]
+        adapter_p = [p for n, p in model.named_parameters()
+                     if p.requires_grad and "post_scan_adapter" in n]
+        other_p   = [p for n, p in model.named_parameters()
+                     if p.requires_grad and "lora_" not in n and "post_scan_adapter" not in n]
         return AdamW([
-            {"params": other_p, "lr": LR_NEW_LAYERS},
-            {"params": lora_p,  "lr": LR_LORA},
+            {"params": other_p,   "lr": LR_NEW_LAYERS},
+            {"params": lora_p,    "lr": LR_LORA},
+            {"params": adapter_p, "lr": LR_NEW_LAYERS * 5},  # 5× for randomly-initialized adapter
         ], weight_decay=0.01)
 
     optimizer = _make_optim()
     # Updated for modern PyTorch to prevent deprecation spam
-    scaler    = torch.amp.GradScaler("cuda")
+    scaler    = torch.amp.GradScaler("cuda", enabled=False)
     wandb.watch(model, criterion, log="all", log_freq=50)
 
     total_steps  = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
@@ -946,8 +958,22 @@ def train():
 
                     # Hyperedge similarity heatmap every 50th batch
                     if bi % 50 == 0:
-                        log_hyperedge_attention(model, H_hyp, inc,
-                                                batch.get("movie_name", [""])[0])
+                        _mname = batch["movie_name"][0] if batch.get("movie_name") else ""
+                        log_hyperedge_attention(model, H_hyp, inc, _mname)
+
+                    # Full 4-panel hypergraph visualization once per epoch (first batch)
+                    if bi == 0:
+                        _mname = batch["movie_name"][0] if batch.get("movie_name") else ""
+                        _enames = batch["entity_names"][0] if batch.get("entity_names") else []
+                        _save = f"/tmp/uday/hypergraph_epoch{epoch+1}.png"
+                        log_hypergraph_to_wandb(
+                            inc[0].cpu(), _enames,
+                            entity_type_ids=enid[0].cpu(),
+                            entity_mask=emk[0].cpu(),
+                            movie_name=_mname,
+                            step=epoch + 1,
+                            save_path=_save,
+                        )
 
         avg_eval = eval_loss_sum / max(len(eval_dl), 1)
 
