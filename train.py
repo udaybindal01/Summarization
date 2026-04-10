@@ -678,14 +678,7 @@ def train():
         model.pointer_head.forward = types.MethodType(_no_ptr, model.pointer_head)
         print("ABLATION: pointer head disabled")
 
-    # Xavier init for new (non-pretrained) layers
-    _skip = {"roberta", "bart_decoder", "head", "scene_proj"}
-    for name, param in model.named_parameters():
-        if param.requires_grad and not any(s in name for s in _skip):
-            if len(param.shape) > 1:
-                torch.nn.init.xavier_uniform_(param)
-
-    # ── 4. Checkpoint resumption ──────────────────────────────────────────────
+    # ── 4. Checkpoint detection ───────────────────────────────────────────────
     ckpt_latest = "/tmp/uday/checkpoints/dual_hyp_latest.pt"
     start_epoch = 0
     ckpt_state  = None
@@ -694,7 +687,32 @@ def train():
         ckpt_state  = torch.load(ckpt_latest, map_location=device, weights_only=True)
         start_epoch = ckpt_state.get("epoch", 0)
 
-    # ── 5. Stage setup ────────────────────────────────────────────────────────
+    # ── 5a. Xavier init for new (non-pretrained) layers ───────────────────────
+    # Runs BEFORE checkpoint load so checkpoint values overwrite random init on
+    # matching keys. New params not present in the checkpoint keep their Xavier init.
+    _skip = {"roberta", "bart_decoder", "head", "scene_proj"}
+    for name, param in model.named_parameters():
+        if param.requires_grad and not any(s in name for s in _skip):
+            if len(param.shape) > 1:
+                torch.nn.init.xavier_uniform_(param)
+
+    # ── 5b. Checkpoint load — MUST happen before LoRA wrapping ────────────────
+    # After get_peft_model(), Mamba key names change:
+    #   mamba_tower.layers.*  →  mamba_tower.base_model.model.layers.*
+    # Loading the checkpoint after LoRA wrap causes all Mamba weights to be
+    # silently skipped (key mismatch under strict=False) → random Mamba → NaN.
+    if ckpt_state:
+        cur = model.state_dict()
+        ckpt_params = ckpt_state["model_state_dict"]
+        mismatched = [k for k, v in ckpt_params.items()
+                      if k in cur and v.shape != cur[k].shape]
+        if mismatched:
+            print(f"  Skipping {len(mismatched)} shape-mismatched param(s) from checkpoint "
+                  f"(arch change): {mismatched}")
+        compatible = {k: v for k, v in ckpt_params.items() if k not in mismatched}
+        model.load_state_dict(compatible, strict=False)
+
+    # ── 5c. Stage setup + LoRA — applied AFTER checkpoint load ────────────────
     lora_applied = False
 
     def apply_lora(r=16, alpha=32):
@@ -731,24 +749,10 @@ def train():
                 p.requires_grad = True  # covers post_scan_adapter, hypergraph, raft, etc.
 
     if start_epoch >= EPOCHS_STAGE1:
-        apply_lora(r=64, alpha=128)
+        apply_lora(r=64, alpha=128)   # wraps correctly-loaded Mamba weights
         _set_stage2_grads()
     else:
         _set_stage1_grads()
-
-    if ckpt_state:
-        cur = model.state_dict()
-        ckpt_params = ckpt_state["model_state_dict"]
-        # strict=False skips missing/extra keys but still raises on shape mismatches —
-        # filter those out so old checkpoints survive arch changes (e.g. FFN 4×→2×).
-        mismatched = [k for k, v in ckpt_params.items()
-                      if k in cur and v.shape != cur[k].shape]
-        if mismatched:
-            print(f"  Skipping {len(mismatched)} shape-mismatched param(s) from checkpoint "
-                  f"(arch change): {mismatched}")
-        compatible = {k: v for k, v in ckpt_params.items()
-                      if k not in mismatched}
-        model.load_state_dict(compatible, strict=False)
 
     # ── 6. Loss ───────────────────────────────────────────────────────────────
     criterion = RelationalEventConsistencyLoss(
