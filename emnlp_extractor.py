@@ -366,7 +366,8 @@ def main():
         for ex in tqdm(dataset, desc="Building scene list (MovieSum)"):
             scenes_data  = ex.get("script", ex.get("screenplay", ex.get("scenes", "")))
             summary_text = ex.get("summary", "")
-            movie_id     = ex.get("name", ex.get("title", ex.get("movie_id", "movie")))
+            # Updated to match the exact Hugging Face schema we saw in the screenshot
+            movie_id = str(ex.get("movie_name", ex.get("imdb_id", f"movie_{idx}")))
             
             if isinstance(scenes_data, list):
                 scenes_data = "\n".join([str(s) for s in scenes_data])
