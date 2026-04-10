@@ -737,7 +737,18 @@ def train():
         _set_stage1_grads()
 
     if ckpt_state:
-        model.load_state_dict(ckpt_state["model_state_dict"], strict=False)
+        cur = model.state_dict()
+        ckpt_params = ckpt_state["model_state_dict"]
+        # strict=False skips missing/extra keys but still raises on shape mismatches —
+        # filter those out so old checkpoints survive arch changes (e.g. FFN 4×→2×).
+        mismatched = [k for k, v in ckpt_params.items()
+                      if k in cur and v.shape != cur[k].shape]
+        if mismatched:
+            print(f"  Skipping {len(mismatched)} shape-mismatched param(s) from checkpoint "
+                  f"(arch change): {mismatched}")
+        compatible = {k: v for k, v in ckpt_params.items()
+                      if k not in mismatched}
+        model.load_state_dict(compatible, strict=False)
 
     # ── 6. Loss ───────────────────────────────────────────────────────────────
     criterion = RelationalEventConsistencyLoss(

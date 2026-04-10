@@ -363,11 +363,15 @@ def main():
     elif args.dataset == "moviesum":
         print("Downloading MovieSum dataset...", flush=True)
         dataset = load_dataset("rohitsaxena/MovieSum", split="train")
-        for ex in tqdm(dataset, desc="Building scene list (MovieSum)"):
+        for idx, ex in enumerate(tqdm(dataset, desc="Building scene list (MovieSum)")):
             scenes_data  = ex.get("script", ex.get("screenplay", ex.get("scenes", "")))
             summary_text = ex.get("summary", "")
-            # Updated to match the exact Hugging Face schema we saw in the screenshot
-            movie_id = str(ex.get("movie_name", ex.get("imdb_id", f"movie_{idx}")))
+            # movie_name / imdb_id can be None → str(None)="None" makes every scene share
+            # the same base, collapsing 1800 movies into 1. Use 'or' to skip falsy values.
+            raw_id   = ex.get("movie_name") or ex.get("title") or ex.get("imdb_id")
+            movie_id = str(raw_id).strip() if raw_id else f"movie_{idx}"
+            # Sanitise: remove characters that would corrupt the _Scene_ split key
+            movie_id = re.sub(r"[^A-Za-z0-9 _\-]", "", movie_id).strip() or f"movie_{idx}"
             
             if isinstance(scenes_data, list):
                 scenes_data = "\n".join([str(s) for s in scenes_data])
