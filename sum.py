@@ -477,6 +477,14 @@ class PostScanCrossAttentionAdapter(nn.Module):
         # True = ignore (PyTorch MHA convention)
         key_pad_nodes = ~entity_mask
 
+        # --- NEW SAFETY VALVE ---
+        # If any movie in the batch has 100% True (all masked), unmask the 0th index 
+        # to prevent Softmax(-inf) generating NaNs.
+        all_masked = key_pad_nodes.all(dim=-1)
+        if all_masked.any():
+            key_pad_nodes[all_masked, 0] = False
+        # ------------------------
+
         # Cross 1: scenes attend to nodes
         s_star, _ = self.attn_scene_to_node(
             query=norm_s, key=norm_n, value=norm_n,
