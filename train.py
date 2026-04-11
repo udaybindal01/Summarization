@@ -1021,11 +1021,11 @@ def train():
                                         use_stemmer=True)
             r1, r2, rL = rs["rouge1"], rs["rouge2"], rs["rougeL"]
 
-            bs_out = bertscore_metric.compute(
-                predictions=all_preds, references=all_refs,
-                lang="en", model_type="roberta-large",
-            )
-            bs_f1  = sum(bs_out["f1"]) / max(len(bs_out["f1"]), 1)
+            # bs_out = bertscore_metric.compute(
+            #     predictions=all_preds, references=all_refs,
+            #     lang="en", model_type="roberta-large",
+            # )
+            # bs_f1  = sum(bs_out["f1"]) / max(len(bs_out["f1"]), 1)
 
             met    = meteor_metric.compute(
                 predictions=all_preds, references=all_refs

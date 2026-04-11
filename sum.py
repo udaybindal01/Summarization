@@ -326,7 +326,8 @@ class NarrativeCoherenceLoss(nn.Module):
             scene_reps = scene_hidden.mean(dim=2)   
         else:
             scene_reps = scene_hidden
-        scene_reps = F.normalize(scene_reps.float(), p=2, dim=-1)
+        # scene_reps = F.normalize(scene_reps.float(), p=2, dim=-1)
+        scene_reps = F.normalize(scene_reps.float(), p=2, dim=-1, eps=1e-8)
 
         total_loss = scene_reps.new_tensor(0.0)
         n_valid    = 0
