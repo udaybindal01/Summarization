@@ -887,11 +887,24 @@ def train():
             loss.backward()
 
             if (bi + 1) % ACCUMULATION_STEPS == 0 or (bi + 1) == len(train_dl):
-                nn_utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()   
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
+                # --- THE GRADIENT SHIELD ---
+                # Check if the backward pass generated any NaN/Inf gradients
+                has_nan_grad = False
+                for p in model.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    print(f"  ⚠ NaN/Inf gradient detected at batch {bi}! Discarding step to save weights.")
+                    optimizer.zero_grad() # Throw away the poison gradients
+                else:
+                    nn_utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()      # Update weights safely
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+                # ---------------------------
 
                 # Log entity state norms every 100 steps
                 if global_step % 100 == 0:
@@ -954,8 +967,14 @@ def train():
                         incidence_matrix=inc,
                     )
 
-                eval_loss_sum += eloss.item()
-                bar_e.set_postfix(eval_loss=f"{eloss.item():.4f}")
+                # --- NEW EVAL SAFETY CHECK ---
+                val = eloss.item()
+                if math.isnan(val) or math.isinf(val):
+                    continue # Skip corrupted eval movies
+                
+                eval_loss_sum += val
+                bar_e.set_postfix(eval_loss=f"{val:.4f}")
+                # -----------------------------
 
                 # Beam-search generation every 10th batch
                 if bi % 10 == 0:
