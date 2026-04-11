@@ -8,7 +8,7 @@ Upgrades for EMNLP (Dual-Tower Latent Hypergraph):
   - Clean Tokenization: XML tags are stripped before passing to BART/spaCy to prevent 
     dependency parse corruption, using offset mapping to preserve mask alignment.
   - Removed hardcoded _VERB_CLASS_MAP (shifting to Latent Edge embeddings).
-  - Exact Character Extraction using <character> XML tags.
+  - Robust Character Extraction: Fallbacks to regex parsing to prevent NaN explosions.
 """
 
 import json
@@ -126,13 +126,39 @@ def clean_and_map_xml(xml_text):
     clean_text = "".join(clean_chars)
     return clean_text, char_to_modality
 
-def extract_scene_speakers(xml_text):
+def extract_robust_characters(scene_xml, clean_text):
     """
-    Extract speaking character names precisely from <character> tags.
+    Extract speaking character names precisely from <character> tags,
+    with a regex fallback to catch ALL-CAPS names in scene descriptions
+    to prevent NaN errors on silent/action-heavy movies.
     """
-    speakers = re.findall(r'<character>(.*?)</character>', xml_text, re.IGNORECASE)
-    # Deduplicate, strip whitespace, and uppercase
-    return sorted(list(set([s.strip().upper() for s in speakers if s.strip()])))
+    # 1. Grab official tags
+    speakers = re.findall(r'<character>(.*?)</character>', scene_xml, re.IGNORECASE)
+    official_chars = [s.strip().upper() for s in speakers if s.strip()]
+    
+    # 2. Fallback: Hunt for ALL CAPS in descriptions
+    descriptions = re.findall(r'<scene_description>(.*?)</scene_description>', scene_xml, re.IGNORECASE)
+    desc_text = " ".join(descriptions)
+    
+    hidden_names = re.findall(r'\b[A-Z]{2,}(?:\s+[A-Z]{2,})*\b', desc_text)
+    
+    # Standard screenplay jargon to filter out
+    jargon = {"INT", "EXT", "DAY", "NIGHT", "CONTINUOUS", "O.S.", "V.O.", "LATER", 
+              "INT.", "EXT.", "WITH", "THE", "AND", "THAT"}
+    
+    for name in hidden_names:
+        clean_name = name.strip()
+        if clean_name not in jargon and clean_name.upper() not in official_chars:
+            official_chars.append(clean_name.upper())
+
+    # 3. Absolute last resort to prevent graph NaN explosion
+    if not official_chars and clean_text.strip():
+        # Grab the first word so the graph has at least one node to attach attention to
+        words = clean_text.split()
+        fallback = words[0].upper() if words else "UNKNOWN"
+        official_chars.append(fallback)
+        
+    return sorted(list(set(official_chars)))
 
 # ---------------------------------------------------------------------------
 # Sentiment helpers (GPU, batched)
@@ -305,7 +331,7 @@ def process_scene(scene_xml, summary, scene_id,
         "entity_mask":     entity_mask,
         "header_mask":     header_mask,
         "graph_triplets":  triplets,
-        "characters":      extract_scene_speakers(scene_xml), # Use raw XML to extract perfect names
+        "characters":      extract_robust_characters(scene_xml, clean_text), 
         "ner_entities":    ner_entities,      
         "scene_meta": {
             "dialogue_density": round(dial_density, 4),
@@ -331,9 +357,6 @@ def main():
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
-    # Note: We NO LONGER load spaCy or the tokenizer here in the main process.
-    # They are loaded inside init_worker() for each CPU core.
-
     print("Loading sentiment model on GPU...", flush=True)
     device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sent_tok   = AutoTokenizer.from_pretrained(_SENTIMENT_MODEL)
@@ -343,7 +366,6 @@ def main():
 
     all_scenes = []
 
-    # --- (Keep your existing dataset loading code here exactly as it is) ---
     if args.dataset == "mensa":
         print("Downloading MENSA dataset...", flush=True)
         dataset = load_dataset("rohitsaxena/MENSA", split="train")
@@ -366,11 +388,8 @@ def main():
         for idx, ex in enumerate(tqdm(dataset, desc="Building scene list (MovieSum)")):
             scenes_data  = ex.get("script", ex.get("screenplay", ex.get("scenes", "")))
             summary_text = ex.get("summary", "")
-            # movie_name / imdb_id can be None → str(None)="None" makes every scene share
-            # the same base, collapsing 1800 movies into 1. Use 'or' to skip falsy values.
             raw_id   = ex.get("movie_name") or ex.get("title") or ex.get("imdb_id")
             movie_id = str(raw_id).strip() if raw_id else f"movie_{idx}"
-            # Sanitise: remove characters that would corrupt the _Scene_ split key
             movie_id = re.sub(r"[^A-Za-z0-9 _\-]", "", movie_id).strip() or f"movie_{idx}"
             
             if isinstance(scenes_data, list):
@@ -388,14 +407,11 @@ def main():
                             "summary": summary_text,
                             "id": f"{movie_id}_Scene_{i:03d}",
                         })
-    # -----------------------------------------------------------------------
 
     end = args.end if args.end > 0 else len(all_scenes)
     all_scenes = all_scenes[args.start:end]
     print(f"Processing {len(all_scenes):,} scenes (indices {args.start}–{end})", flush=True)
 
-    # Leave one core free for the GPU/Main process
-    # num_workers = max(1, mp.cpu_count() - 1)
     num_workers = min(16, max(1, mp.cpu_count() - 1))
     print(f"Starting multiprocessing pool with {num_workers} CPU workers...", flush=True)
 
@@ -403,17 +419,13 @@ def main():
     buffer  = []
 
     with gzip.open(args.out, "wt", encoding="utf-8") as out_f:
-        # Launch the multiprocessing pool
-
         with mp.Pool(processes=num_workers, initializer=init_worker, maxtasksperchild=50) as pool:
-            # imap_unordered is incredibly fast because it yields results as soon as any worker finishes
             iterator = pool.imap_unordered(process_scene_wrapper, all_scenes, chunksize=32)
             
             for pre in tqdm(iterator, total=len(all_scenes), desc="Extracting", unit="scene"):
                 if pre is not None:
                     buffer.append(pre)
 
-                # Once we hit 512, pause the main loop to run the GPU sentiment batch
                 if len(buffer) >= _WRITE_EVERY:
                     for rec in attach_emotions(buffer, sent_tok, sent_model, device):
                         out_f.write(json.dumps(rec) + "\n")
@@ -421,7 +433,6 @@ def main():
                     buffer = []
                     out_f.flush()
 
-            # Flush remaining items
             if buffer:
                 for rec in attach_emotions(buffer, sent_tok, sent_model, device):
                     out_f.write(json.dumps(rec) + "\n")
