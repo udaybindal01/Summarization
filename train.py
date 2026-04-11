@@ -779,7 +779,7 @@ def train():
 
     optimizer = _make_optim()
     # Updated for modern PyTorch to prevent deprecation spam
-    scaler    = torch.amp.GradScaler("cuda", enabled=False)
+    # scaler    = torch.amp.GradScaler("cuda", enabled=False)
     wandb.watch(model, criterion, log="all", log_freq=50)
 
     total_steps  = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
@@ -834,7 +834,7 @@ def train():
             apply_lora(r=16, alpha=32)
             _set_stage2_grads()
             optimizer = _make_optim()
-            scaler    = torch.amp.GradScaler("cuda", enabled=False)
+            # scaler    = torch.amp.GradScaler("cuda", enabled=False)
             s2_total  = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS_STAGE2
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer, num_warmup_steps=int(0.05 * s2_total),
@@ -883,13 +883,12 @@ def train():
                 optimizer.zero_grad()
                 continue
 
-            scaler.scale(loss).backward()
+            # scaler.scale(loss).backward()
+            loss.backward()
 
             if (bi + 1) % ACCUMULATION_STEPS == 0 or (bi + 1) == len(train_dl):
-                scaler.unscale_(optimizer)
                 nn_utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()   
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -976,10 +975,12 @@ def train():
                     mem_pad[all_masked, 0] = False
                     enc_attn = (~mem_pad).long()
 
-                    pred = generate_summary(
-                        model, aligned_mem, enc_attn, tokenizer,
-                        device, max_new_tokens=200, beam_size=4,
-                    )
+                    # Wrap the generation in the same bfloat16 context
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        pred = generate_summary(
+                            model, aligned_mem, enc_attn, tokenizer,
+                            device, max_new_tokens=200, beam_size=4,
+                        )
                     ref  = tokenizer.decode(
                         tgt[0, 0].cpu().tolist(), skip_special_tokens=True
                     )
