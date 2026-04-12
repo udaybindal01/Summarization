@@ -94,6 +94,9 @@ class MambaLayer(nn.Module):
         for t in range(seq_len):
             h = h * torch.exp(-delta[:, t].unsqueeze(-1)) + \
                 (B_mat[:, t].unsqueeze(1) * x_act_f32[:, t].unsqueeze(-1))
+            # Clamp SSM state to prevent unbounded accumulation → NaN after many training steps.
+            # SSM equilibrium value is ~input_magnitude/delta; 100 is safe for all realistic inputs.
+            h = h.clamp(-100.0, 100.0)
             y[:, t, :] = (h * C[:, t].unsqueeze(1)).sum(dim=-1)
         return self.out_proj(y.to(x.dtype) * F.silu(z)) + residual
 
@@ -203,28 +206,36 @@ class DynamicHypergraphTower(nn.Module):
             # Stream 2 (Arc State): Historical context from past scenes sharing these entities
             msg_arc = torch.zeros_like(msg_scene)
             if s > 0:
-                past_hyperedges = torch.stack(hyperedge_list[:-1], dim=1) # [B, s, D]
+                # Detach past_hyperedges: gradients should NOT flow back through the entire
+                # scene history (tanh^64 through sequential GRU = vanishing/exploding grads).
+                # The arc stream provides context, not differentiable history.
+                past_hyperedges = torch.stack(hyperedge_list[:-1], dim=1).detach()  # [B, s, D]
                 past_roles = incidence_matrix[:, :, :s] # [B, N, s]
-                
-                # Overlap calculation: How much does Scene s share with past Scene p?
-                # Uses role weights natively: overlapping main characters yield higher attention
-                arc_attention = past_roles * roles.unsqueeze(-1) # [B, N, s]
-                
-                # Optional Temporal Decay: recent scenes matter slightly more
+
+                # Overlap: role weight product gives entity-scene relevance
+                arc_attention = past_roles * roles.unsqueeze(-1)  # [B, N, s]
+
+                # Temporal decay: recent scenes matter slightly more
                 decay = torch.exp(torch.linspace(-1, 0, s, device=scene_reps.device))
                 arc_attention = arc_attention * decay.unsqueeze(0).unsqueeze(0)
-                
-                # Aggregate past hyperedges for each entity
-                arc_features = torch.bmm(arc_attention, past_hyperedges) # [B, N, D]
+
+                # Normalize along scene dimension — prevents sum growing with movie length.
+                # Without this, a 64-scene movie has arc_features ~64× larger than a 4-scene one.
+                arc_attention = arc_attention / arc_attention.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+                arc_features = torch.bmm(arc_attention, past_hyperedges)  # [B, N, D]
                 msg_arc = self.msg_arc_proj(arc_features)
 
             # Stream 3 (Interaction State): Who else is in the room? (Social Context)
-            # Create role-weighted co-occurrence matrix for this specific scene
-            co_occur = torch.bmm(roles.unsqueeze(-1), roles.unsqueeze(1)) # [B, N, N]
-            co_occur.diagonal(dim1=1, dim2=2).zero_() # Remove self-loops
-            
-            # Entities absorb states from other entities they are interacting with
-            social_features = torch.bmm(co_occur, h_entities) # [B, N, D]
+            # Role-weighted co-occurrence matrix for this specific scene
+            co_occur = torch.bmm(roles.unsqueeze(-1), roles.unsqueeze(1))  # [B, N, N]
+            co_occur.diagonal(dim1=1, dim2=2).zero_()   # remove self-loops
+
+            # Normalize rows: without this, an entity with 100 co-present entities absorbs
+            # 100× the state of an entity with 1 co-present entity → msg_interact explodes.
+            co_occur = co_occur / co_occur.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+            social_features = torch.bmm(co_occur, h_entities)  # [B, N, D]
             msg_interact = self.msg_interact_proj(social_features)
 
             # ── Learnable Fusion & GRU Update ────────────────────────────
@@ -370,6 +381,10 @@ class RelationalEventConsistencyLoss(nn.Module):
 
     def _smooth_nll(self, log_probs, targets, weight_mask):
         V      = log_probs.size(-1)
+        # Clamp log_probs: avoids positive_smooth_weight * (-inf) = -inf in sum,
+        # which propagates to loss=+inf → skipped batch → stalled training.
+        # -100 is well below any meaningful log probability and safe for gradients.
+        log_probs = log_probs.clamp(min=-100.0)
         smooth = torch.zeros_like(log_probs).fill_(self.label_smoothing / V)
         smooth.scatter_(1, targets.unsqueeze(1).clamp(min=0), 1.0 - self.label_smoothing)
         nll    = -(smooth * log_probs).sum(dim=-1)
@@ -377,7 +392,7 @@ class RelationalEventConsistencyLoss(nn.Module):
         return (nll * weight_mask * valid).sum() / (weight_mask * valid).sum().clamp(min=1.0)
 
     def _triplet_embeds(self, trips, head_weight, device, max_t=5):
-        if not trips or not trips[0]: return None
+        if not trips or not trips[0] or self.tokenizer is None: return None
         texts = []
         for scene_trips in trips:
             sampled = (random.sample(scene_trips, max_t) if len(scene_trips) > max_t else scene_trips)
@@ -657,8 +672,12 @@ class DualTowerHypergraphSummariser(nn.Module):
                     dec_hidden, fused_scenes, triplets, self.tokenizer, self.head.weight, input_ids.device
                 )
                 final_probs = p_gen * vocab_probs + (1 - p_gen) * ptr_pr  # BF16 ~25 MB
+                # Cast to FP32 and clamp BEFORE normalization and log.
+                # BF16 convex combination can produce slightly negative values due to
+                # precision loss, which makes torch.log return NaN.
+                final_probs = final_probs.float().clamp(min=0.0)
                 final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                final_log_probs = torch.log(final_probs.float() + 1e-8)   # cast FP32 only here
+                final_log_probs = torch.log(final_probs + 1e-8)
             else:
                 final_log_probs = F.log_softmax(vocab_logits.float(), dim=-1)
 

@@ -774,7 +774,7 @@ def train():
         return AdamW([
             {"params": other_p,   "lr": LR_NEW_LAYERS},
             {"params": lora_p,    "lr": LR_LORA},
-            {"params": adapter_p, "lr": LR_NEW_LAYERS * 2},  # 2× for randomly-initialized adapter (5× caused NaN)
+            {"params": adapter_p, "lr": LR_NEW_LAYERS},  # same as other new layers; 2× caused NaN
         ], weight_decay=0.01)
 
     optimizer = _make_optim()
@@ -843,8 +843,17 @@ def train():
 
         # ── Train ─────────────────────────────────────────────────────────────
         model.train()
-        train_loss_sum = 0.0
+        train_loss_sum  = 0.0
+        n_valid_batches = 0  # count only non-NaN batches for correct loss average
         optimizer.zero_grad()
+
+        # Rolling good-state checkpoint: saved every GOOD_STATE_FREQ optimizer steps.
+        # If weights go NaN (from a step that passed the gradient shield but still
+        # produced a bad update), we restore from this snapshot instead of corrupting
+        # all subsequent epochs.
+        GOOD_STATE_FREQ = 50
+        good_state      = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        last_good_step  = 0
 
         bar = tqdm(train_dl, desc=f"E{epoch+1} Train", unit="batch")
         for bi, batch in enumerate(bar):
@@ -883,28 +892,46 @@ def train():
                 optimizer.zero_grad()
                 continue
 
-            # scaler.scale(loss).backward()
             loss.backward()
 
             if (bi + 1) % ACCUMULATION_STEPS == 0 or (bi + 1) == len(train_dl):
                 # --- THE GRADIENT SHIELD ---
-                # Check if the backward pass generated any NaN/Inf gradients
                 has_nan_grad = False
                 for p in model.parameters():
                     if p.grad is not None and not torch.isfinite(p.grad).all():
                         has_nan_grad = True
                         break
-                
+
                 if has_nan_grad:
-                    print(f"  ⚠ NaN/Inf gradient detected at batch {bi}! Discarding step to save weights.")
-                    optimizer.zero_grad() # Throw away the poison gradients
+                    print(f"  ⚠ NaN gradient at batch {bi}, discarding step")
+                    optimizer.zero_grad()
                 else:
-                    nn_utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()      # Update weights safely
+                    nn_utils.clip_grad_norm_(model.parameters(), 0.5)  # tighter than 1.0
+                    optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
-                # ---------------------------
+
+                    # ── Weight NaN guard ─────────────────────────────────────────
+                    # Detect if the optimizer step silently produced NaN weights
+                    # (can happen when Adam's v_hat is very small for newly-trained
+                    # params, making lr * m/sqrt(v) > BF16 safe range).
+                    weight_nan = any(
+                        not torch.isfinite(p.data).all()
+                        for p in model.parameters() if p.requires_grad
+                    )
+                    if weight_nan:
+                        print(f"  ☠ NaN in weights at step {global_step}! Restoring from step {last_good_step}")
+                        model.load_state_dict(good_state)
+                        optimizer.zero_grad()
+                        # Reset Adam running stats for affected params to avoid re-corruption
+                        optimizer.state.clear()
+                        global_step = last_good_step
+                    elif global_step % GOOD_STATE_FREQ == 0:
+                        # Save a clean snapshot periodically
+                        good_state     = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                        last_good_step = global_step
+                    # ──────────────────────────────────────────────────────────
 
                 # Log entity state norms every 100 steps
                 if global_step % 100 == 0:
@@ -914,12 +941,12 @@ def train():
                             inc, etid, enid, emk,
                             target_ids=None, triplets=None,
                         )
-                    # Run hypergraph tower alone for node states
-                    H_t = H_t4d.mean(dim=2)
-                    _, H_nodes = model.hypergraph_tower(H_t, inc, etid, enid, emk)
-                    log_entity_state_norms(H_nodes, emk, global_step)
+                        H_t = H_t4d.mean(dim=2)
+                        _, H_nodes = model.hypergraph_tower(H_t, inc, etid, enid, emk)
+                        log_entity_state_norms(H_nodes, emk, global_step)
 
-            train_loss_sum += val
+            train_loss_sum  += val
+            n_valid_batches += 1
             lr_now = optimizer.param_groups[0]["lr"]
             bar.set_postfix(loss=f"{val:.4f}", lr=f"{lr_now:.2e}")
             wandb.log({
@@ -929,7 +956,7 @@ def train():
                 "epoch":            epoch + 1,
             })
 
-        avg_train = train_loss_sum / max(len(train_dl), 1)
+        avg_train = train_loss_sum / max(n_valid_batches, 1)
 
         # ── Eval ──────────────────────────────────────────────────────────────
         model.eval()
