@@ -728,13 +728,20 @@ def train():
         print(f"LoRA applied: r={r}, alpha={alpha}")
 
     def _set_stage1_grads():
-        """Stage 1: freeze RoBERTa + Mamba + pos-embed + adapter; train hypergraph + decoder cross-attn.
-        scene_pos_embed feeds directly into frozen Mamba — must be co-frozen to prevent NaN divergence.
+        """Stage 1: freeze RoBERTa + Mamba + pos-embed + adapter + BART decoder non-cross-attn + lm_head.
+        Trainable: hypergraph tower, scene_proj, RAFT, fusion gate/norm, decoder encoder_attn, pointer_head.
+        NOTE: 'bart_decoder' must be in this freeze list. Without it, _set_stage1_grads unfreezes all
+        200M pretrained BART params at LR=1e-4, causing Adam instability and NaN on step 1.
         """
         for name, p in model.named_parameters():
-            p.requires_grad = not any(s in name for s in
-                                      ["roberta", "mamba_tower", "scene_pos_embed",
-                                       "post_scan_adapter"])
+            if any(s in name for s in ["roberta", "mamba_tower", "scene_pos_embed", "post_scan_adapter"]):
+                p.requires_grad = False
+            elif "bart_decoder.layers" in name and "encoder_attn" not in name:
+                p.requires_grad = False
+            elif "head." in name:
+                p.requires_grad = False
+            else:
+                p.requires_grad = True
 
     def _set_stage2_grads():
         """Stage 2: freeze RoBERTa only; LoRA on Mamba; train everything else including adapter."""
@@ -847,13 +854,6 @@ def train():
         n_valid_batches = 0  # count only non-NaN batches for correct loss average
         optimizer.zero_grad()
 
-        # Rolling good-state checkpoint: saved every GOOD_STATE_FREQ optimizer steps.
-        # If weights go NaN (from a step that passed the gradient shield but still
-        # produced a bad update), we restore from this snapshot instead of corrupting
-        # all subsequent epochs.
-        GOOD_STATE_FREQ = 50
-        good_state      = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        last_good_step  = 0
 
         bar = tqdm(train_dl, desc=f"E{epoch+1} Train", unit="batch")
         for bi, batch in enumerate(bar):
@@ -913,24 +913,17 @@ def train():
                     global_step += 1
 
                     # ── Weight NaN guard ─────────────────────────────────────────
-                    # Detect if the optimizer step silently produced NaN weights
-                    # (can happen when Adam's v_hat is very small for newly-trained
-                    # params, making lr * m/sqrt(v) > BF16 safe range).
-                    weight_nan = any(
-                        not torch.isfinite(p.data).all()
-                        for p in model.parameters() if p.requires_grad
-                    )
-                    if weight_nan:
-                        print(f"  ☠ NaN in weights at step {global_step}! Restoring from step {last_good_step}")
-                        model.load_state_dict(good_state)
-                        optimizer.zero_grad()
-                        # Reset Adam running stats for affected params to avoid re-corruption
-                        optimizer.state.clear()
-                        global_step = last_good_step
-                    elif global_step % GOOD_STATE_FREQ == 0:
-                        # Save a clean snapshot periodically
-                        good_state     = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                        last_good_step = global_step
+                    nan_params = [(n, p) for n, p in model.named_parameters()
+                                  if p.requires_grad and not torch.isfinite(p.data).all()]
+                    if nan_params:
+                        names = [n for n, _ in nan_params[:3]]
+                        print(f"  ☠ NaN in {len(nan_params)} param(s) at step {global_step}: {names}")
+                        # Fix in-place: replace NaN/Inf with 0 rather than restoring whole model.
+                        # Full restore caused an infinite loop (global_step reset → always step 1
+                        # → NaN → restore → step 1...). nan_to_num lets training continue.
+                        for _, p in nan_params:
+                            p.data = torch.nan_to_num(p.data, nan=0.0, posinf=1.0, neginf=-1.0)
+                        optimizer.state.clear()   # reset Adam state for the affected params
                     # ──────────────────────────────────────────────────────────
 
                 # Log entity state norms every 100 steps
