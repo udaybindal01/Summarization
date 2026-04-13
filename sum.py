@@ -138,136 +138,168 @@ class RaftConsensusAttentionV2(nn.Module):
 
 class DynamicHypergraphTower(nn.Module):
     """
-    Upgraded for EMNLP: 3-Stream Architecture with Latent Edges and Role Weights.
+    EMNLP v4: 3-Stream Dynamic Hypergraph Encoder with
+    - Semantic entity name initialization (not just type embeddings)
+    - Scene-conditioned adaptive stream gating (not global weights)
+    - Role-modulated GRU messages
+    - Entity state LayerNorm for long-sequence stability
+    - Hyperedge incidence dropout for graph regularization
     """
-    def __init__(self, d_model=1024, max_entities=100, num_edge_types=5, num_entity_types=5):
+    def __init__(self, d_model=1024, max_entities=100, num_edge_types=5, num_entity_types=5,
+                 use_adaptive_streams=True, use_entity_names=True, edge_dropout=0.1):
         super().__init__()
         self.d_model      = d_model
         self.max_entities = max_entities
+        self.use_adaptive_streams = use_adaptive_streams
+        self.use_entity_names     = use_entity_names
+        self.edge_dropout_rate    = edge_dropout
 
-        # Entity Initialization
+        # Entity Initialization: type embedding + optional name embedding
         self.entity_type_embed = nn.Embedding(num_entity_types, d_model)
+        if use_entity_names:
+            self.entity_name_proj = nn.Sequential(
+                nn.Linear(768, d_model, bias=False), nn.LayerNorm(d_model),
+            )
 
         # Stage 1: Latent Edge Generation
         self.node_to_edge  = nn.Linear(d_model, d_model)
-        self.text_to_edge  = nn.Linear(d_model, d_model)  
+        self.text_to_edge  = nn.Linear(d_model, d_model)
         self.edge_norm     = nn.LayerNorm(d_model)
 
         # Stage 2: 3-Stream Fusion Parameters
-        # Weights: [Stream 1 (Scene), Stream 2 (Arc), Stream 3 (Interaction)]
-        self.stream_weights = nn.Parameter(torch.ones(3))
-        
+        if use_adaptive_streams:
+            # Scene-conditioned gating: the latent edge representation determines
+            # how much each stream contributes — action scenes can up-weight the
+            # scene stream while character reunion scenes up-weight the arc stream.
+            self.stream_gate = nn.Sequential(
+                nn.Linear(d_model, d_model // 4), nn.GELU(),
+                nn.Linear(d_model // 4, 3),
+            )
+        else:
+            # Ablation: global learnable weights (content-agnostic)
+            self.stream_weights = nn.Parameter(torch.zeros(3))
+
         self.msg_scene_proj    = nn.Linear(d_model, d_model)
         self.msg_arc_proj      = nn.Linear(d_model, d_model)
         self.msg_interact_proj = nn.Linear(d_model, d_model)
-        
+
+        # Role modulation: speakers update differently from background mentions
+        self.role_proj = nn.Linear(1, d_model, bias=False)
+
         self.entity_gru = nn.GRUCell(d_model, d_model)
+        # LayerNorm after GRU prevents entity state drift over 64 sequential updates
+        self.entity_update_norm = nn.LayerNorm(d_model)
 
         self.edge_out = nn.Sequential(
             nn.Linear(d_model, d_model), nn.GELU(), nn.LayerNorm(d_model),
         )
         self.residual_norm = nn.LayerNorm(d_model)
 
-    def forward(self, scene_reps, incidence_matrix, edge_type_ids, entity_type_ids, entity_mask):
+    def forward(self, scene_reps, incidence_matrix, edge_type_ids, entity_type_ids, entity_mask,
+                entity_name_embs=None):
         B, S, D = scene_reps.shape
         N = self.max_entities
 
-        # Initialise entity states 
-        h_entities  = self.entity_type_embed(entity_type_ids)           # [B, N, D]
-        ent_mask_f  = entity_mask.unsqueeze(-1).float()                  # [B, N, 1]
-        h_entities  = h_entities * ent_mask_f
+        # ── Entity Initialization ───────────────────────────────────────
+        h_entities = self.entity_type_embed(entity_type_ids)              # [B, N, D]
+        if entity_name_embs is not None and self.use_entity_names:
+            h_entities = h_entities + self.entity_name_proj(entity_name_embs)
+        ent_mask_f = entity_mask.unsqueeze(-1).float()                    # [B, N, 1]
+        h_entities = h_entities * ent_mask_f
+
+        # ── Edge Dropout (training only) ────────────────────────────────
+        if self.training and self.edge_dropout_rate > 0:
+            drop_mask = torch.bernoulli(
+                torch.full_like(incidence_matrix, 1.0 - self.edge_dropout_rate)
+            )
+            incidence_matrix = incidence_matrix * drop_mask
 
         hyperedge_list = []
+        last_stream_attn = None   # for logging
 
         for s in range(S):
-            # Incidence matrix now contains Float Role Weights (1.0, 0.7, 0.5, etc.)
-            roles = incidence_matrix[:, :, s] * entity_mask.float()  # [B, N]
-            
-            # ── Stage 1: Latent Edge Generation ─────────────────────────
-            # Create the hyperedge without relying on hardcoded types
-            entity_weight_sum = roles.sum(dim=1, keepdim=True).clamp(min=1.0)
-            
-            # Weighted mean of entity states based on their role importance
-            mean_ent = torch.bmm(roles.unsqueeze(1), h_entities).squeeze(1) / entity_weight_sum # [B, D]
+            roles = incidence_matrix[:, :, s] * entity_mask.float()       # [B, N]
 
-            # Fuse Entity States + Mamba Text State -> Latent Edge
+            # ── Stage 1: Latent Edge Generation ─────────────────────────
+            entity_weight_sum = roles.sum(dim=1, keepdim=True).clamp(min=1.0)
+            mean_ent = torch.bmm(roles.unsqueeze(1), h_entities).squeeze(1) / entity_weight_sum
+
             e_s = self.edge_norm(
                 self.node_to_edge(mean_ent) + self.text_to_edge(scene_reps[:, s, :])
-            )                                                            
+            )
             hyperedge_list.append(e_s)
 
-            # ── Stage 2: The 3-Stream Message Passing ────────────────────
-            # Only generate messages for entities actually in the scene
-            in_scene_mask = (roles > 0).unsqueeze(-1).float() # [B, N, 1]
-            
-            # Stream 1 (Scene State): What is happening directly in this scene?
-            msg_scene = self.msg_scene_proj(e_s).unsqueeze(1).expand(-1, N, -1) # [B, N, D]
-            
-            # Stream 2 (Arc State): Historical context from past scenes sharing these entities
+            # ── Stage 2: 3-Stream Message Passing ───────────────────────
+            in_scene_mask = (roles > 0).unsqueeze(-1).float()             # [B, N, 1]
+
+            # Stream 1 (Scene): immediate event context
+            msg_scene = self.msg_scene_proj(e_s).unsqueeze(1).expand(-1, N, -1)
+
+            # Stream 2 (Arc): temporal context from past shared scenes
             msg_arc = torch.zeros_like(msg_scene)
             if s > 0:
-                # Detach past_hyperedges: gradients should NOT flow back through the entire
-                # scene history (tanh^64 through sequential GRU = vanishing/exploding grads).
-                # The arc stream provides context, not differentiable history.
-                past_hyperedges = torch.stack(hyperedge_list[:-1], dim=1).detach()  # [B, s, D]
-                past_roles = incidence_matrix[:, :, :s] # [B, N, s]
-
-                # Overlap: role weight product gives entity-scene relevance
-                arc_attention = past_roles * roles.unsqueeze(-1)  # [B, N, s]
-
-                # Temporal decay: recent scenes matter slightly more
+                past_hyperedges = torch.stack(hyperedge_list[:-1], dim=1).detach()
+                past_roles = incidence_matrix[:, :, :s]
+                arc_attention = past_roles * roles.unsqueeze(-1)
                 decay = torch.exp(torch.linspace(-1, 0, s, device=scene_reps.device))
                 arc_attention = arc_attention * decay.unsqueeze(0).unsqueeze(0)
-
-                # Normalize along scene dimension — prevents sum growing with movie length.
-                # Without this, a 64-scene movie has arc_features ~64× larger than a 4-scene one.
                 arc_attention = arc_attention / arc_attention.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                msg_arc = self.msg_arc_proj(torch.bmm(arc_attention, past_hyperedges))
 
-                arc_features = torch.bmm(arc_attention, past_hyperedges)  # [B, N, D]
-                msg_arc = self.msg_arc_proj(arc_features)
-
-            # Stream 3 (Interaction State): Who else is in the room? (Social Context)
-            # Role-weighted co-occurrence matrix for this specific scene
-            co_occur = torch.bmm(roles.unsqueeze(-1), roles.unsqueeze(1))  # [B, N, N]
-            co_occur.diagonal(dim1=1, dim2=2).zero_()   # remove self-loops
-
-            # Normalize rows: without this, an entity with 100 co-present entities absorbs
-            # 100× the state of an entity with 1 co-present entity → msg_interact explodes.
+            # Stream 3 (Interaction): social context from co-occurring entities
+            co_occur = torch.bmm(roles.unsqueeze(-1), roles.unsqueeze(1))
+            co_occur.diagonal(dim1=1, dim2=2).zero_()
             co_occur = co_occur / co_occur.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            msg_interact = self.msg_interact_proj(torch.bmm(co_occur, h_entities))
 
-            social_features = torch.bmm(co_occur, h_entities)  # [B, N, D]
-            msg_interact = self.msg_interact_proj(social_features)
+            # ── Adaptive Stream Fusion ──────────────────────────────────
+            if self.use_adaptive_streams:
+                # Scene-conditioned: the latent edge decides stream mix per scene
+                stream_attn = F.softmax(self.stream_gate(e_s), dim=-1)    # [B, 3]
+                msg_total = (stream_attn[:, 0].view(B, 1, 1) * msg_scene +
+                             stream_attn[:, 1].view(B, 1, 1) * msg_arc +
+                             stream_attn[:, 2].view(B, 1, 1) * msg_interact)
+                last_stream_attn = stream_attn.detach()
+            else:
+                stream_attn = F.softmax(self.stream_weights, dim=0)
+                msg_total = (stream_attn[0] * msg_scene +
+                             stream_attn[1] * msg_arc +
+                             stream_attn[2] * msg_interact)
 
-            # ── Learnable Fusion & GRU Update ────────────────────────────
-            stream_attn = F.softmax(self.stream_weights, dim=0)
-            
-            # Weighted sum of the 3 streams
-            msg_total = (stream_attn[0] * msg_scene) + \
-                        (stream_attn[1] * msg_arc) + \
-                        (stream_attn[2] * msg_interact)
-            
-            # Flatten B×N for GRUCell
-            h_flat    = h_entities.reshape(B * N, D)
-            msg_flat  = msg_total.reshape(B * N, D)
-            h_new     = self.entity_gru(msg_flat, h_flat).reshape(B, N, D)
+            # ── Role Modulation ─────────────────────────────────────────
+            # Speakers (1.0) receive stronger messages than background mentions (0.3)
+            role_emb = self.role_proj(roles.unsqueeze(-1))                # [B, N, D]
+            msg_total = msg_total + role_emb * in_scene_mask
 
-            # Only update valid entities present in this specific scene
+            # ── GRU Update + Normalization ──────────────────────────────
+            h_flat   = h_entities.reshape(B * N, D)
+            msg_flat = msg_total.reshape(B * N, D)
+            h_new    = self.entity_update_norm(
+                self.entity_gru(msg_flat, h_flat).reshape(B, N, D)
+            )
             h_entities = h_entities * (1 - in_scene_mask) + h_new * in_scene_mask
 
-        # Log stream weights to wandb to prove which streams the model relied on
+        # ── Logging ─────────────────────────────────────────────────────
         if wandb.run is not None and random.random() < 0.05:
-            current_attn = F.softmax(self.stream_weights, dim=0).detach().cpu().numpy()
-            wandb.log({
-                "stream_weight/scene": current_attn[0],
-                "stream_weight/arc": current_attn[1],
-                "stream_weight/interaction": current_attn[2],
-            })
+            if self.use_adaptive_streams and last_stream_attn is not None:
+                wandb.log({
+                    "stream_weight/scene": last_stream_attn[:, 0].mean().item(),
+                    "stream_weight/arc": last_stream_attn[:, 1].mean().item(),
+                    "stream_weight/interaction": last_stream_attn[:, 2].mean().item(),
+                })
+            elif not self.use_adaptive_streams:
+                w = F.softmax(self.stream_weights, dim=0).detach().cpu().numpy()
+                wandb.log({
+                    "stream_weight/scene": w[0],
+                    "stream_weight/arc": w[1],
+                    "stream_weight/interaction": w[2],
+                })
 
-        H_hyperedges = torch.stack(hyperedge_list, dim=1)                # [B, S, D]
-        H_hyperedges = self.residual_norm(H_hyperedges + scene_reps)     # residual
-        H_hyperedges = self.edge_out(H_hyperedges)                       # [B, S, D]
+        H_hyperedges = torch.stack(hyperedge_list, dim=1)                 # [B, S, D]
+        H_hyperedges = self.residual_norm(H_hyperedges + scene_reps)
+        H_hyperedges = self.edge_out(H_hyperedges)
 
-        return H_hyperedges, h_entities                                  
+        return H_hyperedges, h_entities
 
 # =============================================================================
 # 4. Hierarchical Pointer Head & Losses (Unchanged logic, preserving stability)
@@ -524,11 +556,13 @@ class PostScanCrossAttentionAdapter(nn.Module):
 # =============================================================================
 
 class DualTowerHypergraphSummariser(nn.Module):
-    def __init__(self, vocab_size, d_model=1024, num_layers=4, max_entities=MAX_ENTITIES, tokenizer=None):
+    def __init__(self, vocab_size, d_model=1024, num_layers=4, max_entities=MAX_ENTITIES, tokenizer=None,
+                 use_adaptive_streams=True, use_entity_names=True, edge_dropout=0.1):
         super().__init__()
         self.d_model      = d_model
         self.max_entities = max_entities
         self.tokenizer    = tokenizer
+        self.use_entity_names = use_entity_names
 
         print(f"Loading BART backbone: {BART_MODEL}...")
         bart = BartForConditionalGeneration.from_pretrained(BART_MODEL)
@@ -551,6 +585,9 @@ class DualTowerHypergraphSummariser(nn.Module):
         self.hypergraph_tower = DynamicHypergraphTower(
             d_model=d_model, max_entities=max_entities,
             num_edge_types=NUM_HYPEREDGE_TYPES, num_entity_types=NUM_ENTITY_TYPES,
+            use_adaptive_streams=use_adaptive_streams,
+            use_entity_names=use_entity_names,
+            edge_dropout=edge_dropout,
         )
 
         self.fusion_gate = nn.Sequential(nn.Linear(d_model * 2, d_model), nn.Sigmoid())
@@ -613,17 +650,46 @@ class DualTowerHypergraphSummariser(nn.Module):
         H_text    = H_text_4d.mean(dim=2)                         
         return H_text, H_text_4d
 
+    @torch.no_grad()
+    def _encode_entity_names(self, entity_names, device):
+        """Encode entity names into 768d vectors using frozen RoBERTa word embeddings.
+        Fast path: just embedding lookup + average, no full RoBERTa forward pass."""
+        B = len(entity_names)
+        N = self.max_entities
+        embs = torch.zeros(B, N, 768, device=device)
+        for b in range(B):
+            names = entity_names[b]
+            valid = [(i, n) for i, n in enumerate(names) if n and i < N]
+            if not valid:
+                continue
+            indices, texts = zip(*valid)
+            enc = self.tokenizer(list(texts), padding=True, truncation=True,
+                                 max_length=8, return_tensors="pt").to(device)
+            word_embs = self.roberta.embeddings.word_embeddings(enc["input_ids"])
+            mask = enc["attention_mask"].unsqueeze(-1).float()
+            avg = (word_embs * mask).sum(1) / mask.sum(1).clamp(min=1)
+            for k, idx in enumerate(indices):
+                embs[b, idx] = avg[k]
+        return embs
+
     def forward(self, input_ids, action_mask, dial_mask, ent_mask, head_mask,
-                incidence_matrix, edge_type_ids, entity_type_ids, entity_mask, target_ids=None, triplets=None):
+                incidence_matrix, edge_type_ids, entity_type_ids, entity_mask,
+                target_ids=None, triplets=None, entity_names=None):
         B, S, L = input_ids.shape
         N       = self.max_entities
         pad_id  = 1
 
         H_text, H_text_4d = self._text_tower(input_ids, action_mask, dial_mask, ent_mask, head_mask)
-        
+
+        # ── Encode entity names (frozen RoBERTa word embeddings) ───────
+        entity_name_embs = None
+        if entity_names is not None and self.use_entity_names and self.tokenizer is not None:
+            entity_name_embs = self._encode_entity_names(entity_names, input_ids.device)
+
         # ── Tower 2 ────────────────────────────────────────────────────────
         H_hyperedges, H_nodes = self.hypergraph_tower(
-            H_text, incidence_matrix, edge_type_ids, entity_type_ids, entity_mask
+            H_text, incidence_matrix, edge_type_ids, entity_type_ids, entity_mask,
+            entity_name_embs=entity_name_embs,
         )
 
         gate         = self.fusion_gate(torch.cat([H_text, H_hyperedges], dim=-1))

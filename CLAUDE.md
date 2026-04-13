@@ -32,6 +32,9 @@ python train.py --run_name ablation_no_raft         --no_raft             # no c
 python train.py --run_name ablation_no_pointer      --no_pointer_head
 python train.py --run_name ablation_no_coherence    --no_coherence_loss
 python train.py --run_name ablation_no_contrastive  --no_contrastive_loss
+python train.py --run_name ablation_global_streams  --no_adaptive_streams   # v4: global vs adaptive
+python train.py --run_name ablation_no_names        --no_entity_names       # v4: no entity name init
+python train.py --run_name ablation_no_edgedrop     --edge_dropout 0.0      # v4: no graph dropout
 python train.py --run_name discograms_baseline      --static_hypergraph --no_gru  # paper baseline
 
 # Key flags
@@ -39,6 +42,7 @@ python train.py --run_name discograms_baseline      --static_hypergraph --no_gru
 --num_layers 4          # number of MambaBlock layers
 --entity_penalty 3.0    # weight for entity consistency loss term
 --dataset moviesum|mensa|both
+--edge_dropout 0.1      # incidence matrix edge dropout (0 = disabled)
 ```
 
 Checkpoints: `/tmp/uday/checkpoints/`. Split files: `/tmp/uday/train_{run_name}.jsonl` and `eval_{run_name}.jsonl`.

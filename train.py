@@ -91,6 +91,13 @@ _p.add_argument("--no_contrastive_loss",action="store_true")
 _p.add_argument("--entity_penalty",     type=float, default=3.0)
 _p.add_argument("--dataset",            type=str,   default="moviesum",
                 choices=["moviesum", "mensa", "both"])
+# v4 hypergraph improvements
+_p.add_argument("--no_adaptive_streams", action="store_true",
+                help="Ablation: use global stream weights instead of scene-conditioned gating")
+_p.add_argument("--no_entity_names",    action="store_true",
+                help="Ablation: do not use entity name embeddings for initialization")
+_p.add_argument("--edge_dropout",       type=float, default=0.1,
+                help="Incidence matrix edge dropout rate during training (0 = disabled)")
 _args, _ = _p.parse_known_args()
 
 _BART_TOKENIZER = _args.bart_tokenizer or _args.bart_model
@@ -110,6 +117,9 @@ ABLATION = {
     "no_contrastive_loss":  _args.no_contrastive_loss,
     "entity_penalty":       _args.entity_penalty,
     "dataset":              _args.dataset,
+    "no_adaptive_streams":  _args.no_adaptive_streams,
+    "no_entity_names":      _args.no_entity_names,
+    "edge_dropout":         _args.edge_dropout,
 }
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -626,8 +636,14 @@ def train():
         num_layers=ABLATION["num_layers"],
         max_entities=MAX_ENTITIES,
         tokenizer=tokenizer,
+        use_adaptive_streams=not ABLATION["no_adaptive_streams"],
+        use_entity_names=not ABLATION["no_entity_names"],
+        edge_dropout=ABLATION["edge_dropout"],
     ).to(device)
-    print(f"Model: d_model={ABLATION['d_model']}  num_layers={ABLATION['num_layers']}")
+    print(f"Model: d_model={ABLATION['d_model']}  num_layers={ABLATION['num_layers']}  "
+          f"adaptive_streams={not ABLATION['no_adaptive_streams']}  "
+          f"entity_names={not ABLATION['no_entity_names']}  "
+          f"edge_dropout={ABLATION['edge_dropout']}")
 
     # Ablation: disable hypergraph tower (text-only baseline)
     if ABLATION["no_hypergraph"]:
@@ -875,12 +891,13 @@ def train():
             emk  = batch["entity_mask"].to(device)
             tgt  = batch["target_ids"].to(device)
             trip = batch["triplets"]
+            enames = batch.get("entity_names")
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 log_pr, H_text_4d, labels, _, H_hyp = model(
                     inp, amsk, dmsk, emsk, hmsk,
                     inc, etid, enid, emk,
-                    target_ids=tgt, triplets=trip,
+                    target_ids=tgt, triplets=trip, entity_names=enames,
                 )
                 log_pr = log_pr.float()
                 loss   = criterion(
@@ -939,7 +956,7 @@ def train():
                         _, H_t4d = model(
                             inp, amsk, dmsk, emsk, hmsk,
                             inc, etid, enid, emk,
-                            target_ids=None, triplets=None,
+                            target_ids=None, triplets=None, entity_names=enames,
                         )
                         H_t = H_t4d.mean(dim=2)
                         _, H_nodes = model.hypergraph_tower(H_t, inc, etid, enid, emk)
@@ -977,12 +994,13 @@ def train():
                 emk  = batch["entity_mask"].to(device)
                 tgt  = batch["target_ids"].to(device)
                 trip = batch["triplets"]
+                enames = batch.get("entity_names")
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     log_pr, H_text_4d, labels, _, H_hyp = model(
                         inp, amsk, dmsk, emsk, hmsk,
                         inc, etid, enid, emk,
-                        target_ids=tgt, triplets=trip,
+                        target_ids=tgt, triplets=trip, entity_names=enames,
                     )
                     log_pr = log_pr.float()
                     eloss  = criterion(
@@ -1008,7 +1026,7 @@ def train():
                     aligned_mem, _ = model(
                         inp, amsk, dmsk, emsk, hmsk,
                         inc, etid, enid, emk,
-                        target_ids=None, triplets=None,
+                        target_ids=None, triplets=None, entity_names=enames,
                     )
                     # enc_attn_mask: scenes + entity nodes
                     mem_pad = torch.zeros(
