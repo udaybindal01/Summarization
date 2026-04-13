@@ -953,18 +953,12 @@ def train():
                     print(f"  ⚠ NaN gradient at batch {bi}, discarding step")
                     optimizer.zero_grad()
                 else:
+                    # Cap individual gradient elements before computing global norm.
+                    # Without this, large-but-finite elements (e.g. 1e20 from encoder_attn
+                    # distribution mismatch) cause sum-of-squares overflow in clip_grad_norm_,
+                    # which poisons ALL gradients with NaN via Inf*0.
+                    nn_utils.clip_grad_value_(model.parameters(), 1.0)
                     nn_utils.clip_grad_norm_(model.parameters(), 0.5)
-                    # Second check: clip_grad_norm_ can silently poison gradients when
-                    # the norm overflows (sum of squared grads → Inf → scale = 0 →
-                    # Inf*0 = NaN for any already-large element). Re-check after clipping.
-                    post_clip_nan = any(
-                        p.grad is not None and not torch.isfinite(p.grad).all()
-                        for p in model.parameters()
-                    )
-                    if post_clip_nan:
-                        print(f"  ⚠ clip_grad_norm_ produced NaN/Inf at batch {bi}, discarding step")
-                        optimizer.zero_grad()
-                        continue
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
