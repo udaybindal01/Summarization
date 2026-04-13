@@ -138,6 +138,7 @@ EPOCHS_STAGE1      = 2    # RoBERTa + Mamba frozen; train hypergraph + decoder
 EPOCHS_STAGE2      = 20   # LoRA on Mamba; full model except frozen RoBERTa
 LR_NEW_LAYERS      = 1e-4
 LR_LORA            = 1e-5
+LR_ENCODER_ATTN    = 1e-6   # pretrained BART cross-attn: tiny LR to avoid NaN with novel encoder stats
 MAX_SEQ_LEN        = 256
 MAX_SCENES         = 64
 
@@ -726,6 +727,19 @@ def train():
             print(f"  Skipping {len(mismatched)} shape-mismatched param(s) from checkpoint "
                   f"(arch change): {mismatched}")
         compatible = {k: v for k, v in ckpt_params.items() if k not in mismatched}
+
+        # Detect encoder_attn weights that were zeroed by the old nan_to_num recovery.
+        # A zeroed encoder_attn weight is all-zero — a dead giveaway it was corrupted,
+        # since real pretrained BART values are never identically zero. Skip loading
+        # these so the pretrained BART initialization (from from_pretrained above) survives.
+        zeroed_enc_attn = [k for k in compatible
+                           if "encoder_attn" in k and compatible[k].eq(0).all()]
+        if zeroed_enc_attn:
+            print(f"  ⚠ Detected {len(zeroed_enc_attn)} zeroed encoder_attn param(s) in checkpoint "
+                  f"(from old nan_to_num recovery). Restoring from pretrained BART instead.")
+            for k in zeroed_enc_attn:
+                del compatible[k]
+
         model.load_state_dict(compatible, strict=False)
 
     # ── 5c. Stage setup + LoRA — applied AFTER checkpoint load ────────────────
@@ -795,16 +809,25 @@ def train():
 
     # ── 7. Optimiser ──────────────────────────────────────────────────────────
     def _make_optim():
-        lora_p    = [p for n, p in model.named_parameters()
-                     if p.requires_grad and "lora_" in n]
-        adapter_p = [p for n, p in model.named_parameters()
-                     if p.requires_grad and "post_scan_adapter" in n]
-        other_p   = [p for n, p in model.named_parameters()
-                     if p.requires_grad and "lora_" not in n and "post_scan_adapter" not in n]
+        lora_p        = [p for n, p in model.named_parameters()
+                         if p.requires_grad and "lora_" in n]
+        adapter_p     = [p for n, p in model.named_parameters()
+                         if p.requires_grad and "post_scan_adapter" in n]
+        enc_attn_p    = [p for n, p in model.named_parameters()
+                         if p.requires_grad and "encoder_attn" in n]
+        other_p       = [p for n, p in model.named_parameters()
+                         if p.requires_grad and "lora_" not in n
+                         and "post_scan_adapter" not in n
+                         and "encoder_attn" not in n]
         return AdamW([
-            {"params": other_p,   "lr": LR_NEW_LAYERS},
-            {"params": lora_p,    "lr": LR_LORA},
-            {"params": adapter_p, "lr": LR_NEW_LAYERS},  # same as other new layers; 2× caused NaN
+            {"params": other_p,    "lr": LR_NEW_LAYERS},
+            {"params": lora_p,     "lr": LR_LORA},
+            {"params": adapter_p,  "lr": LR_NEW_LAYERS},  # same as other new layers; 2× caused NaN
+            # Pretrained BART cross-attn weights get a tiny LR. At 1e-4 (same as new layers)
+            # they go NaN on step 1 — the encoder stats (from our tower) differ from the BART
+            # encoder stats these weights were pretrained on, causing large first-step gradients
+            # that blow up with fresh Adam state. 1e-6 lets them adapt without exploding.
+            {"params": enc_attn_p, "lr": LR_ENCODER_ATTN},
         ], weight_decay=0.01)
 
     optimizer = _make_optim()
@@ -930,30 +953,32 @@ def train():
                     print(f"  ⚠ NaN gradient at batch {bi}, discarding step")
                     optimizer.zero_grad()
                 else:
-                    nn_utils.clip_grad_norm_(model.parameters(), 0.5)  # tighter than 1.0
+                    nn_utils.clip_grad_norm_(model.parameters(), 0.5)
+                    # Second check: clip_grad_norm_ can silently poison gradients when
+                    # the norm overflows (sum of squared grads → Inf → scale = 0 →
+                    # Inf*0 = NaN for any already-large element). Re-check after clipping.
+                    post_clip_nan = any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in model.parameters()
+                    )
+                    if post_clip_nan:
+                        print(f"  ⚠ clip_grad_norm_ produced NaN/Inf at batch {bi}, discarding step")
+                        optimizer.zero_grad()
+                        continue
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
 
-                    # ── Weight NaN guard ─────────────────────────────────────────
+                    # ── Weight NaN guard (diagnostic only) ───────────────────
+                    # With encoder_attn at LR=1e-6 (its own param group), NaN should
+                    # not occur. This block now only logs if something unexpected appears;
+                    # it no longer zeroes weights (zeroing caused silent quality collapse).
                     nan_params = [(n, p) for n, p in model.named_parameters()
                                   if p.requires_grad and not torch.isfinite(p.data).all()]
                     if nan_params:
                         names = [n for n, _ in nan_params[:3]]
                         print(f"  ☠ NaN in {len(nan_params)} param(s) at step {global_step}: {names}")
-                        # Fix in-place: replace NaN/Inf with 0 rather than restoring whole model.
-                        # Full restore caused an infinite loop (global_step reset → always step 1
-                        # → NaN → restore → step 1...). nan_to_num lets training continue.
-                        for _, p in nan_params:
-                            p.data = torch.nan_to_num(p.data, nan=0.0, posinf=1.0, neginf=-1.0)
-                        # Only clear Adam state for the NaN-affected params, not ALL params.
-                        # optimizer.state.clear() was resetting momentum/variance for every
-                        # parameter, so Adam took oversized steps on the next iteration → NaN
-                        # again → infinite loop.
-                        for _, p in nan_params:
-                            if p in optimizer.state:
-                                del optimizer.state[p]
                     # ──────────────────────────────────────────────────────────
 
                 # Log entity state norms every 500 steps (extra forward pass — avoid every 100)
