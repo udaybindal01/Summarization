@@ -712,6 +712,10 @@ class DualTowerHypergraphSummariser(nn.Module):
         valid_nodes    = entity_mask.unsqueeze(-1).float() * H_nodes
         aligned_memory = torch.cat([fused_scenes, valid_nodes], dim=1)
         aligned_memory = self.memory_norm(aligned_memory)
+        # Clamp encoder hidden states before BART cross-attention.
+        # Extreme values from fusion/hypergraph tower cause NaN in encoder_attn
+        # k/v projections on the very first optimizer step.
+        aligned_memory = aligned_memory.clamp(-50.0, 50.0)
 
         if target_ids is not None:
             single_target   = target_ids[:, 0, :]                      

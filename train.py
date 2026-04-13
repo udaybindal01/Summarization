@@ -947,7 +947,13 @@ def train():
                         # → NaN → restore → step 1...). nan_to_num lets training continue.
                         for _, p in nan_params:
                             p.data = torch.nan_to_num(p.data, nan=0.0, posinf=1.0, neginf=-1.0)
-                        optimizer.state.clear()   # reset Adam state for the affected params
+                        # Only clear Adam state for the NaN-affected params, not ALL params.
+                        # optimizer.state.clear() was resetting momentum/variance for every
+                        # parameter, so Adam took oversized steps on the next iteration → NaN
+                        # again → infinite loop.
+                        for _, p in nan_params:
+                            if p in optimizer.state:
+                                del optimizer.state[p]
                     # ──────────────────────────────────────────────────────────
 
                 # Log entity state norms every 500 steps (extra forward pass — avoid every 100)
