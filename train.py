@@ -736,9 +736,9 @@ def train():
         for name, p in model.named_parameters():
             if any(s in name for s in ["roberta", "mamba_tower", "scene_pos_embed", "post_scan_adapter"]):
                 p.requires_grad = False
-            elif "bart_decoder.layers" in name and "encoder_attn" not in name:
+            elif "bart_decoder" in name and "encoder_attn" not in name:
                 p.requires_grad = False
-            elif "head." in name:
+            elif name.startswith("head."):
                 p.requires_grad = False
             else:
                 p.requires_grad = True
@@ -748,9 +748,9 @@ def train():
         for name, p in model.named_parameters():
             if "roberta" in name:
                 p.requires_grad = False
-            elif "bart_decoder.layers" in name and "encoder_attn" not in name:
+            elif "bart_decoder" in name and "encoder_attn" not in name:
                 p.requires_grad = False
-            elif "head." in name:
+            elif name.startswith("head."):
                 p.requires_grad = False
             else:
                 p.requires_grad = True  # covers post_scan_adapter, hypergraph, raft, etc.
@@ -760,6 +760,13 @@ def train():
         _set_stage2_grads()
     else:
         _set_stage1_grads()
+
+    # Diagnostic: verify freeze policy
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    frozen    = {n for n, p in model.named_parameters() if not p.requires_grad}
+    print(f"  Trainable: {len(trainable)} params, Frozen: {len(frozen)} params")
+    print(f"  Trainable groups: {sorted(set(n.split('.')[0] for n in trainable))}")
+    print(f"  Sample trainable: {sorted(trainable)[:8]}")
 
     # ── 6. Loss ───────────────────────────────────────────────────────────────
     criterion = RelationalEventConsistencyLoss(
