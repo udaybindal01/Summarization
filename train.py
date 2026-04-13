@@ -950,8 +950,8 @@ def train():
                         optimizer.state.clear()   # reset Adam state for the affected params
                     # ──────────────────────────────────────────────────────────
 
-                # Log entity state norms every 100 steps
-                if global_step % 100 == 0:
+                # Log entity state norms every 500 steps (extra forward pass — avoid every 100)
+                if global_step % 500 == 0:
                     with torch.no_grad():
                         _, H_t4d = model(
                             inp, amsk, dmsk, emsk, hmsk,
@@ -1022,7 +1022,7 @@ def train():
                 # -----------------------------
 
                 # Beam-search generation every 10th batch
-                if bi % 10 == 0:
+                if bi % 50 == 0:
                     aligned_mem, _ = model(
                         inp, amsk, dmsk, emsk, hmsk,
                         inc, etid, enid, emk,
