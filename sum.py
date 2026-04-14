@@ -601,8 +601,6 @@ class DualTowerHypergraphSummariser(nn.Module):
 
         for p in self.bart_decoder.parameters(): p.requires_grad = False
         for p in self.head.parameters(): p.requires_grad = False
-        for name, p in self.bart_decoder.named_parameters():
-            if "encoder_attn" in name: p.requires_grad = True
 
         # Fix 3: Post-scan cross-attention adapter (before pointer head)
         self.post_scan_adapter = PostScanCrossAttentionAdapter(d_model)

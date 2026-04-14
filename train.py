@@ -138,7 +138,6 @@ EPOCHS_STAGE1      = 2    # RoBERTa + Mamba frozen; train hypergraph + decoder
 EPOCHS_STAGE2      = 20   # LoRA on Mamba; full model except frozen RoBERTa
 LR_NEW_LAYERS      = 1e-4
 LR_LORA            = 1e-5
-LR_ENCODER_ATTN    = 1e-6   # pretrained BART cross-attn: tiny LR to avoid NaN with novel encoder stats
 MAX_SEQ_LEN        = 256
 MAX_SCENES         = 64
 
@@ -758,15 +757,14 @@ def train():
         print(f"LoRA applied: r={r}, alpha={alpha}")
 
     def _set_stage1_grads():
-        """Stage 1: freeze RoBERTa + Mamba + pos-embed + adapter + BART decoder non-cross-attn + lm_head.
-        Trainable: hypergraph tower, scene_proj, RAFT, fusion gate/norm, decoder encoder_attn, pointer_head.
-        NOTE: 'bart_decoder' must be in this freeze list. Without it, _set_stage1_grads unfreezes all
-        200M pretrained BART params at LR=1e-4, causing Adam instability and NaN on step 1.
+        """Stage 1: freeze RoBERTa + Mamba + pos-embed + adapter + entire BART decoder + lm_head.
+        Trainable: hypergraph tower, scene_proj, RAFT, fusion gate/norm, post_scan_adapter, pointer_head.
+        encoder_attn is fully frozen — PostScanCrossAttentionAdapter handles cross-modal alignment.
         """
         for name, p in model.named_parameters():
             if any(s in name for s in ["roberta", "mamba_tower", "scene_pos_embed", "post_scan_adapter"]):
                 p.requires_grad = False
-            elif "bart_decoder" in name and "encoder_attn" not in name:
+            elif "bart_decoder" in name:
                 p.requires_grad = False
             elif name.startswith("head."):
                 p.requires_grad = False
@@ -778,7 +776,7 @@ def train():
         for name, p in model.named_parameters():
             if "roberta" in name:
                 p.requires_grad = False
-            elif "bart_decoder" in name and "encoder_attn" not in name:
+            elif "bart_decoder" in name:
                 p.requires_grad = False
             elif name.startswith("head."):
                 p.requires_grad = False
@@ -809,25 +807,17 @@ def train():
 
     # ── 7. Optimiser ──────────────────────────────────────────────────────────
     def _make_optim():
-        lora_p        = [p for n, p in model.named_parameters()
-                         if p.requires_grad and "lora_" in n]
-        adapter_p     = [p for n, p in model.named_parameters()
-                         if p.requires_grad and "post_scan_adapter" in n]
-        enc_attn_p    = [p for n, p in model.named_parameters()
-                         if p.requires_grad and "encoder_attn" in n]
-        other_p       = [p for n, p in model.named_parameters()
-                         if p.requires_grad and "lora_" not in n
-                         and "post_scan_adapter" not in n
-                         and "encoder_attn" not in n]
+        lora_p    = [p for n, p in model.named_parameters()
+                     if p.requires_grad and "lora_" in n]
+        adapter_p = [p for n, p in model.named_parameters()
+                     if p.requires_grad and "post_scan_adapter" in n]
+        other_p   = [p for n, p in model.named_parameters()
+                     if p.requires_grad and "lora_" not in n
+                     and "post_scan_adapter" not in n]
         return AdamW([
             {"params": other_p,    "lr": LR_NEW_LAYERS},
             {"params": lora_p,     "lr": LR_LORA},
-            {"params": adapter_p,  "lr": LR_NEW_LAYERS},  # same as other new layers; 2× caused NaN
-            # Pretrained BART cross-attn weights get a tiny LR. At 1e-4 (same as new layers)
-            # they go NaN on step 1 — the encoder stats (from our tower) differ from the BART
-            # encoder stats these weights were pretrained on, causing large first-step gradients
-            # that blow up with fresh Adam state. 1e-6 lets them adapt without exploding.
-            {"params": enc_attn_p, "lr": LR_ENCODER_ATTN},
+            {"params": adapter_p,  "lr": LR_NEW_LAYERS},
         ], weight_decay=0.01)
 
     optimizer = _make_optim()
