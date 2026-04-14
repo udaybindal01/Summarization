@@ -790,11 +790,14 @@ def train():
         _set_stage1_grads()
 
     # Diagnostic: verify freeze policy
-    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
-    frozen    = {n for n, p in model.named_parameters() if not p.requires_grad}
-    print(f"  Trainable: {len(trainable)} params, Frozen: {len(frozen)} params")
-    print(f"  Trainable groups: {sorted(set(n.split('.')[0] for n in trainable))}")
-    print(f"  Sample trainable: {sorted(trainable)[:8]}")
+    trainable_named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    frozen_named    = [(n, p) for n, p in model.named_parameters() if not p.requires_grad]
+    trainable_M = sum(p.numel() for _, p in trainable_named) / 1e6
+    frozen_M    = sum(p.numel() for _, p in frozen_named)    / 1e6
+    print(f"  Trainable: {len(trainable_named)} tensors / {trainable_M:.1f}M params")
+    print(f"  Frozen:    {len(frozen_named)} tensors / {frozen_M:.1f}M params")
+    print(f"  Trainable groups: {sorted(set(n.split('.')[0] for n, _ in trainable_named))}")
+    print(f"  Sample trainable: {sorted(n for n, _ in trainable_named)[:8]}")
 
     # ── 6. Loss ───────────────────────────────────────────────────────────────
     criterion = RelationalEventConsistencyLoss(
