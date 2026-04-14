@@ -936,6 +936,18 @@ def train():
             val = loss.item() * ACCUMULATION_STEPS
             if math.isnan(val) or math.isinf(val):
                 print(f"  ⚠ NaN/Inf at batch {bi}, skipping")
+                # Emergency: if loss is NaN, model weights may be corrupted.
+                # Scan and recover immediately — don't wait for the gradient step.
+                nan_w = [(n, p) for n, p in model.named_parameters()
+                         if not torch.isfinite(p.data).all()]
+                if nan_w:
+                    print(f"    → {len(nan_w)} weight tensor(s) contain NaN — recovering: "
+                          f"{[n for n, _ in nan_w[:3]]}")
+                    for _, p in nan_w:
+                        p.data = torch.nan_to_num(p.data, nan=0.0, posinf=1.0, neginf=-1.0)
+                    for _, p in nan_w:
+                        if p in optimizer.state:
+                            del optimizer.state[p]
                 optimizer.zero_grad()
                 continue
 
@@ -964,15 +976,23 @@ def train():
                     optimizer.zero_grad()
                     global_step += 1
 
-                    # ── Weight NaN guard (diagnostic only) ───────────────────
-                    # With encoder_attn at LR=1e-6 (its own param group), NaN should
-                    # not occur. This block now only logs if something unexpected appears;
-                    # it no longer zeroes weights (zeroing caused silent quality collapse).
+                    # ── Weight NaN guard ─────────────────────────────────────
+                    # Recover from rare NaN weights (e.g. BF16 precision loss in
+                    # Stage 2). Uses nan_to_num + per-param Adam state reset.
+                    # Unlike the old version, this does NOT trigger an infinite
+                    # loop because encoder_attn now has its own 1e-6 LR group
+                    # and clip_grad_value_ prevents gradient overflow.
                     nan_params = [(n, p) for n, p in model.named_parameters()
                                   if p.requires_grad and not torch.isfinite(p.data).all()]
                     if nan_params:
                         names = [n for n, _ in nan_params[:3]]
                         print(f"  ☠ NaN in {len(nan_params)} param(s) at step {global_step}: {names}")
+                        for _, p in nan_params:
+                            p.data = torch.nan_to_num(p.data, nan=0.0, posinf=1.0, neginf=-1.0)
+                        # Only clear Adam state for affected params (not all).
+                        for _, p in nan_params:
+                            if p in optimizer.state:
+                                del optimizer.state[p]
                     # ──────────────────────────────────────────────────────────
 
                 # Log entity state norms every 500 steps (extra forward pass — avoid every 100)

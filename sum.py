@@ -277,6 +277,9 @@ class DynamicHypergraphTower(nn.Module):
             h_new    = self.entity_update_norm(
                 self.entity_gru(msg_flat, h_flat).reshape(B, N, D)
             )
+            # Clamp entity states: 64 sequential GRU updates can accumulate
+            # magnitude despite LayerNorm, especially in BF16.
+            h_new    = h_new.clamp(-50.0, 50.0)
             h_entities = h_entities * (1 - in_scene_mask) + h_new * in_scene_mask
 
         # ── Logging ─────────────────────────────────────────────────────
@@ -644,6 +647,9 @@ class DualTowerHypergraphSummariser(nn.Module):
             local_feats.append(c_out)
 
         local_flat = torch.cat(local_feats, dim=0)
+        # Mamba SSM can produce extreme activations when LoRA modifies dt_proj
+        # (exp(-softplus(dt)*A) overflow). Clamp before downstream amplification.
+        local_flat = local_flat.clamp(-100.0, 100.0)
         H_text_4d  = local_flat.view(B, S, L, self.d_model)
         flat  = H_text_4d.view(B * S, L, self.d_model)
         fused = self.raft(
@@ -712,17 +718,32 @@ class DualTowerHypergraphSummariser(nn.Module):
         valid_nodes    = entity_mask.unsqueeze(-1).float() * H_nodes
         aligned_memory = torch.cat([fused_scenes, valid_nodes], dim=1)
         aligned_memory = self.memory_norm(aligned_memory)
-        # Clamp encoder hidden states before BART cross-attention.
-        # Extreme values from fusion/hypergraph tower cause NaN in encoder_attn
-        # k/v projections on the very first optimizer step.
         aligned_memory = aligned_memory.clamp(-50.0, 50.0)
 
+        # ── NaN trace: log first occurrence per forward pass ────────────
+        def _nan_tag(name, t):
+            if not torch.isfinite(t).all():
+                print(f"    [NaN-trace] {name}: "
+                      f"NaN={t.isnan().sum().item()} Inf={t.isinf().sum().item()} "
+                      f"shape={list(t.shape)} range=[{t[t.isfinite()].min().item():.2f}, "
+                      f"{t[t.isfinite()].max().item():.2f}]"
+                      if t.isfinite().any() else
+                      f"    [NaN-trace] {name}: ALL non-finite, shape={list(t.shape)}")
+                return True
+            return False
+        _nan_tag("H_text", H_text)
+        _nan_tag("H_hyperedges", H_hyperedges)
+        _nan_tag("H_nodes", H_nodes)
+        _nan_tag("fused_scenes", fused_scenes)
+        _nan_tag("aligned_memory", aligned_memory)
+        # ────────────────────────────────────────────────────────────────
+
         if target_ids is not None:
-            single_target   = target_ids[:, 0, :]                      
+            single_target   = target_ids[:, 0, :]
             labels          = single_target[:, 1:].contiguous()
             dec_start       = torch.full((B, 1), 2, dtype=torch.long, device=input_ids.device)
-            shifted_targets = torch.cat([dec_start, single_target[:, 1:-1]], dim=1).contiguous()                                              
-            
+            shifted_targets = torch.cat([dec_start, single_target[:, 1:-1]], dim=1).contiguous()
+
             mem_pad = torch.zeros(B, S + N, dtype=torch.bool, device=input_ids.device)
             mem_pad[:, :S] = (input_ids[:, :, 0] == pad_id)
             mem_pad[:, S:] = ~entity_mask
@@ -736,22 +757,23 @@ class DualTowerHypergraphSummariser(nn.Module):
                 encoder_hidden_states=aligned_memory, encoder_attention_mask=enc_attn_mask,
             )
             dec_hidden    = decoder_out.last_hidden_state
-            # Keep in autocast dtype (BF16) until the very end — three ~50 MB vocab tensors
-            # materialised in FP32 was the direct cause of OOM at Stage 2.
             vocab_logits  = self.head(dec_hidden)
+            _nan_tag("dec_hidden", dec_hidden)
+            _nan_tag("vocab_logits", vocab_logits)
 
             if triplets is not None and self.tokenizer is not None:
-                vocab_probs    = F.softmax(vocab_logits, dim=-1)           # BF16 ~25 MB
+                # Compute softmax in float32 to avoid BF16 producing exact 0s → log(0) = NaN
+                vocab_probs    = F.softmax(vocab_logits.float(), dim=-1).to(vocab_logits.dtype)
                 p_gen, ptr_pr  = self.pointer_head(
                     dec_hidden, fused_scenes, triplets, self.tokenizer, self.head.weight, input_ids.device
                 )
-                final_probs = p_gen * vocab_probs + (1 - p_gen) * ptr_pr  # BF16 ~25 MB
-                # Cast to FP32 and clamp BEFORE normalization and log.
-                # BF16 convex combination can produce slightly negative values due to
-                # precision loss, which makes torch.log return NaN.
+                _nan_tag("p_gen", p_gen)
+                _nan_tag("ptr_pr", ptr_pr)
+                final_probs = p_gen * vocab_probs + (1 - p_gen) * ptr_pr  # BF16
                 final_probs = final_probs.float().clamp(min=0.0)
                 final_probs = final_probs / final_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
                 final_log_probs = torch.log(final_probs + 1e-8)
+                _nan_tag("final_log_probs", final_log_probs)
             else:
                 final_log_probs = F.log_softmax(vocab_logits.float(), dim=-1)
 
