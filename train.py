@@ -244,9 +244,19 @@ class MovieHypergraphDataset(Dataset):
     """
 
     _STOP = frozenset({
+        # Pronouns and determiners
         "man", "woman", "him", "her", "he", "she", "they", "them",
         "it", "one", "two", "other", "others", "that", "this", "i",
-        "we", "you", "who", "what", "guy", "person",
+        "we", "you", "who", "what", "guy", "person", "people", "men",
+        "women", "boy", "girl", "kid", "kids", "everyone", "someone",
+        "anyone", "nobody", "somebody", "nothing", "everything",
+        # Generic objects/places that appear in most scenes (cause dense incidence)
+        "car", "door", "room", "house", "gun", "phone", "table", "hand",
+        "night", "day", "time", "way", "thing", "place", "home", "street",
+        "office", "bar", "money", "world", "body", "head", "face", "eyes",
+        "back", "life", "death", "water", "blood", "floor", "wall", "bed",
+        "side", "end", "part", "case", "lot", "wife", "husband", "father",
+        "mother", "son", "daughter", "brother", "sister", "friend", "baby",
     })
 
     def __init__(self, scene_dataset, max_scenes=MAX_SCENES,
@@ -290,14 +300,18 @@ class MovieHypergraphDataset(Dataset):
             if n and len(n) > 1 and n not in self._STOP:
                 ents.setdefault(n, "PERSON")
 
-        # 3. SVO subjects and objects (fallback)
+        # 3. SVO subjects and objects (strict: only capitalized proper nouns)
+        # Common nouns from SVO ("car", "door", "gun") appear in most scenes
+        # and destroy incidence matrix sparsity. Only keep names (Title Case).
         for trip in scene.get("graph_triplets", []):
             parts = trip.split("_")
             for field_idx in (0, 2):
                 if len(parts) > field_idx:
-                    raw = parts[field_idx].replace("NOT ", "").strip().lower()
-                    if raw and raw.isalpha() and len(raw) > 2 and raw not in self._STOP:
-                        ents.setdefault(raw, "OTHER")
+                    raw = parts[field_idx].replace("NOT ", "").strip()
+                    # Only keep if it looks like a proper noun (starts uppercase)
+                    if (raw and raw[0].isupper() and raw.isalpha()
+                            and len(raw) > 2 and raw.lower() not in self._STOP):
+                        ents.setdefault(raw.lower(), "PERSON")
         return ents
 
     # ── Main item builder ──────────────────────────────────────────────────
