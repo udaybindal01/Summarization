@@ -727,16 +727,14 @@ def train():
                   f"(arch change): {mismatched}")
         compatible = {k: v for k, v in ckpt_params.items() if k not in mismatched}
 
-        # Detect encoder_attn weights that were zeroed by the old nan_to_num recovery.
-        # A zeroed encoder_attn weight is all-zero — a dead giveaway it was corrupted,
-        # since real pretrained BART values are never identically zero. Skip loading
-        # these so the pretrained BART initialization (from from_pretrained above) survives.
-        zeroed_enc_attn = [k for k in compatible
-                           if "encoder_attn" in k and compatible[k].eq(0).all()]
-        if zeroed_enc_attn:
-            print(f"  ⚠ Detected {len(zeroed_enc_attn)} zeroed encoder_attn param(s) in checkpoint "
-                  f"(from old nan_to_num recovery). Restoring from pretrained BART instead.")
-            for k in zeroed_enc_attn:
+        # Skip encoder_attn from checkpoint: model reinitializes these from scratch
+        # via _reinit_encoder_attn() (Xavier init). Old checkpoints contain either
+        # pretrained BART values (useless for our encoder) or NaN-corrupted zeros.
+        old_enc_attn = [k for k in compatible if "encoder_attn" in k]
+        if old_enc_attn:
+            print(f"  Skipping {len(old_enc_attn)} encoder_attn param(s) from checkpoint "
+                  f"(model reinitializes from scratch via Xavier init)")
+            for k in old_enc_attn:
                 del compatible[k]
 
         model.load_state_dict(compatible, strict=False)
@@ -757,14 +755,16 @@ def train():
         print(f"LoRA applied: r={r}, alpha={alpha}")
 
     def _set_stage1_grads():
-        """Stage 1: freeze RoBERTa + Mamba + pos-embed + adapter + entire BART decoder + lm_head.
-        Trainable: hypergraph tower, scene_proj, RAFT, fusion gate/norm, post_scan_adapter, pointer_head.
-        encoder_attn is fully frozen — PostScanCrossAttentionAdapter handles cross-modal alignment.
+        """Stage 1: freeze RoBERTa + Mamba + pos-embed + BART decoder (except encoder_attn) + lm_head.
+        Trainable: hypergraph tower, scene_proj, RAFT, fusion, post_scan_adapter,
+                   encoder_attn (Xavier-init), pointer_head.
+        encoder_attn is freshly initialized (not pretrained) so trains safely at LR_NEW_LAYERS.
+        post_scan_adapter is unblocked here so the encoder→decoder bridge learns from epoch 1.
         """
         for name, p in model.named_parameters():
-            if any(s in name for s in ["roberta", "mamba_tower", "scene_pos_embed", "post_scan_adapter"]):
+            if any(s in name for s in ["roberta", "mamba_tower", "scene_pos_embed"]):
                 p.requires_grad = False
-            elif "bart_decoder" in name:
+            elif "bart_decoder" in name and "encoder_attn" not in name:
                 p.requires_grad = False
             elif name.startswith("head."):
                 p.requires_grad = False
@@ -772,16 +772,17 @@ def train():
                 p.requires_grad = True
 
     def _set_stage2_grads():
-        """Stage 2: freeze RoBERTa only; LoRA on Mamba; train everything else including adapter."""
+        """Stage 2: freeze RoBERTa only; LoRA on Mamba; train everything else including adapter.
+        encoder_attn (Xavier-init) continues training alongside all new layers."""
         for name, p in model.named_parameters():
             if "roberta" in name:
                 p.requires_grad = False
-            elif "bart_decoder" in name:
+            elif "bart_decoder" in name and "encoder_attn" not in name:
                 p.requires_grad = False
             elif name.startswith("head."):
                 p.requires_grad = False
             else:
-                p.requires_grad = True  # covers post_scan_adapter, hypergraph, raft, etc.
+                p.requires_grad = True  # covers post_scan_adapter, encoder_attn, hypergraph, raft, etc.
 
     if start_epoch >= EPOCHS_STAGE1:
         apply_lora(r=64, alpha=128)   # wraps correctly-loaded Mamba weights
@@ -1017,6 +1018,10 @@ def train():
         model.eval()
         eval_loss_sum = 0.0
         all_preds, all_refs = [], []
+        # Hypergraph quality accumulators
+        hg_entities_per_scene = []   # avg non-zero roles per scene
+        hg_scenes_per_entity  = []   # avg scenes each entity appears in
+        hg_entity_coverage    = []   # fraction of ref entities found in hypergraph
 
         bar_e = tqdm(eval_dl, desc=f"E{epoch+1} Eval", unit="batch")
         with torch.no_grad():
@@ -1059,8 +1064,31 @@ def train():
                 bar_e.set_postfix(eval_loss=f"{val:.4f}")
                 # -----------------------------
 
-                # Beam-search generation every 10th batch
-                if bi % 50 == 0:
+                # ── Hypergraph quality stats (every batch, cheap) ──────────
+                inc_b = inc[0].cpu().float()   # [N, S]
+                active = (inc_b > 0).float()
+                ents_per_scene = active.sum(dim=0)   # entities per scene
+                scenes_per_ent = active.sum(dim=1)   # scenes per entity
+                hg_entities_per_scene.append(ents_per_scene[ents_per_scene > 0].mean().item()
+                                             if ents_per_scene.sum() > 0 else 0.0)
+                hg_scenes_per_entity.append(scenes_per_ent[scenes_per_ent > 0].mean().item()
+                                            if scenes_per_ent.sum() > 0 else 0.0)
+
+                # Entity coverage: do hypergraph entities appear in the reference?
+                if enames and enames[0]:
+                    ref_text = tokenizer.decode(tgt[0, 0].cpu().tolist(), skip_special_tokens=True).lower()
+                    hg_names = [n.lower() for n in enames[0] if n]
+                    if hg_names:
+                        found = sum(1 for n in hg_names if n in ref_text)
+                        hg_entity_coverage.append(found / len(hg_names))
+
+                # Fusion gate: 1.0 = all text tower, 0.0 = all hypergraph tower
+                if hasattr(model, "_last_gate_mean"):
+                    wandb.log({"eval/fusion_gate_mean": model._last_gate_mean,
+                               "epoch": epoch + 1})
+
+                # Beam-search generation every 10th batch (~30 samples for stable metrics)
+                if bi % 10 == 0:
                     aligned_mem, _ = model(
                         inp, amsk, dmsk, emsk, hmsk,
                         inc, etid, enid, emk,
@@ -1140,11 +1168,23 @@ def train():
               f"R1 {r1:.4f} | R2 {r2:.4f} | RL {rL:.4f} | "
               f"BS {bs_f1:.4f} | METEOR {met:.4f} | EntF1 {ent_f1:.4f}")
 
+        # Hypergraph quality summary
+        avg_ents_per_scene = sum(hg_entities_per_scene) / max(len(hg_entities_per_scene), 1)
+        avg_scenes_per_ent = sum(hg_scenes_per_entity)  / max(len(hg_scenes_per_entity), 1)
+        avg_ent_coverage   = sum(hg_entity_coverage)     / max(len(hg_entity_coverage), 1)
+        print(f"  Hypergraph: {avg_ents_per_scene:.1f} ents/scene, "
+              f"{avg_scenes_per_ent:.1f} scenes/ent, "
+              f"entity_coverage={avg_ent_coverage:.3f}")
+
         wandb.log({
             "epoch/train_loss": avg_train, "epoch/eval_loss": avg_eval,
             "epoch/rouge1": r1, "epoch/rouge2": r2, "epoch/rougeL": rL,
             "epoch/bertscore_f1": bs_f1, "epoch/meteor": met,
-            "epoch/entity_f1": ent_f1, "epoch": epoch + 1,
+            "epoch/entity_f1": ent_f1,
+            "epoch/hg_ents_per_scene": avg_ents_per_scene,
+            "epoch/hg_scenes_per_entity": avg_scenes_per_ent,
+            "epoch/hg_entity_coverage": avg_ent_coverage,
+            "epoch": epoch + 1,
         })
 
         # ── Checkpoint ────────────────────────────────────────────────────────

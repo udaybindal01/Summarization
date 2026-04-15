@@ -602,11 +602,34 @@ class DualTowerHypergraphSummariser(nn.Module):
         for p in self.bart_decoder.parameters(): p.requires_grad = False
         for p in self.head.parameters(): p.requires_grad = False
 
+        # Reinitialize encoder_attn from scratch: pretrained BART cross-attention
+        # expects BART encoder output which our custom encoder never produces.
+        # Xavier init means cross-attn starts near-zero (no-op via residual connection),
+        # so the decoder initially works as an LM and gradually learns to condition on
+        # our encoder. No NaN because there's no pretrained-weight/novel-input mismatch.
+        self._reinit_encoder_attn()
+
         # Fix 3: Post-scan cross-attention adapter (before pointer head)
         self.post_scan_adapter = PostScanCrossAttentionAdapter(d_model)
         self.pointer_head = HierarchicalPointerHeadV2(d_model, vocab_size)
         self.memory_norm  = nn.LayerNorm(d_model)
         self.use_checkpointing = True
+
+    def _reinit_encoder_attn(self):
+        """Reinitialize all encoder_attn + encoder_attn_layer_norm from scratch."""
+        for name, p in self.bart_decoder.named_parameters():
+            if "encoder_attn" not in name:
+                continue
+            p.requires_grad = True
+            if "layer_norm" in name:
+                if "weight" in name:
+                    nn.init.ones_(p)
+                else:
+                    nn.init.zeros_(p)
+            elif "bias" in name:
+                nn.init.zeros_(p)
+            elif p.dim() >= 2:
+                nn.init.xavier_uniform_(p)
 
     def enable_gradient_checkpointing(self):
         self.use_checkpointing = True
@@ -701,6 +724,8 @@ class DualTowerHypergraphSummariser(nn.Module):
         )
 
         gate         = self.fusion_gate(torch.cat([H_text, H_hyperedges], dim=-1))
+        # Store gate stats for diagnostics (readable via model._last_gate_mean)
+        self._last_gate_mean = gate.detach().mean().item()
         fused_scenes = self.fusion_norm(gate * H_text + (1 - gate) * H_hyperedges)
 
         # Fix 3: bidirectional cross-attention adapter before decoder fusion.
