@@ -315,7 +315,11 @@ class HierarchicalPointerHeadV2(nn.Module):
         self.query_proj    = nn.Linear(d_model, d_model)
         self.key_proj      = nn.Linear(d_model, d_model)
         self.p_gen_linear  = nn.Linear(d_model * 2, 1)
-        nn.init.constant_(self.p_gen_linear.bias, 3.0)
+        nn.init.zeros_(self.p_gen_linear.weight)
+        nn.init.zeros_(self.p_gen_linear.bias)
+        # bias=0 → p_gen starts at sigmoid(0)=0.5 (50% vocab / 50% pointer)
+        # Previously bias=3.0 with *(x-0.5)*10 scaling → sigmoid(25)≈1.0,
+        # gradient≈0, pointer never learned anything.
 
     def forward(self, decoder_states, scene_memory, triplets, tokenizer, embedding_weight, device):
         B, T, D = decoder_states.shape
@@ -327,7 +331,7 @@ class HierarchicalPointerHeadV2(nn.Module):
         scene_attn = F.softmax(scores, dim=-1)                          
 
         context   = torch.matmul(scene_attn, scene_memory)             
-        p_gen     = torch.sigmoid((self.p_gen_linear(torch.cat([decoder_states, context], dim=-1)) - 0.5) * 10.0)
+        p_gen     = torch.sigmoid(self.p_gen_linear(torch.cat([decoder_states, context], dim=-1)))
 
         # Use the same dtype as decoder_states (BF16 under autocast) to avoid a [B,S,V] FP32 allocation
         scene_to_token = torch.zeros(B, S, self.vocab_size, device=device,

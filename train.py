@@ -550,14 +550,23 @@ def split_dataset_by_movie(input_path, train_path, eval_path, num_train=1500):
 
 @torch.no_grad()
 def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
-                     device, max_new_tokens=200, beam_size=4):
+                     device, max_new_tokens=200, beam_size=4,
+                     scene_count=None, triplets=None):
     """
     Beam search over the BART decoder using pre-computed aligned_memory.
     aligned_memory  : [1, S+N, D]
     enc_attn_mask   : [1, S+N]
+    scene_count     : S — number of scene slots at the start of aligned_memory
+    triplets        : per-scene triplet lists, used by pointer head
     """
     B = aligned_memory.size(0)
     assert B == 1
+
+    # Extract scene part for pointer head (aligned_memory = cat[fused_scenes, nodes])
+    fused_scenes = aligned_memory[:, :scene_count, :] if scene_count is not None else None
+    use_pointer  = (fused_scenes is not None and triplets is not None
+                    and model.tokenizer is not None
+                    and not ABLATION.get("no_pointer_head", False))
 
     beams     = [(0.0, [tokenizer.bos_token_id or 0])]
     completed = []
@@ -578,8 +587,21 @@ def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
                 encoder_hidden_states=aligned_memory,
                 encoder_attention_mask=enc_attn_mask,
             )
-            logits    = model.head(dec_out.last_hidden_state[:, -1, :]).float()
-            log_probs = F.log_softmax(logits, dim=-1).squeeze(0)
+            last_hidden = dec_out.last_hidden_state  # [1, T, D]
+            logits      = model.head(last_hidden[:, -1, :]).float()  # [1, V]
+
+            if use_pointer:
+                p_gen, ptr_pr = model.pointer_head(
+                    last_hidden, fused_scenes, triplets,
+                    model.tokenizer, model.head.weight, device,
+                )
+                # Use last decoder step: p_gen [1,1], ptr_pr [1,V]
+                p_g   = p_gen[:, -1, :].float()             # [1, 1]
+                p_ptr = ptr_pr[:, -1, :].float()            # [1, V]
+                mixed = p_g * F.softmax(logits, dim=-1) + (1 - p_g) * p_ptr
+                log_probs = torch.log(mixed.clamp(min=1e-8)).squeeze(0)
+            else:
+                log_probs = F.log_softmax(logits, dim=-1).squeeze(0)
 
             # No-repeat trigram penalty
             if len(tokens) >= 3:
@@ -773,6 +795,14 @@ def train():
                 del compatible[k]
 
         model.load_state_dict(compatible, strict=False)
+
+        # Reset pointer head: old checkpoints have a broken p_gen_linear
+        # (bias=3.0 with *(x-0.5)*10 scaling → sigmoid(25)≈1, gradient≈0).
+        # Force zero init so the fixed plain-sigmoid formula starts at p_gen=0.5.
+        with torch.no_grad():
+            nn.init.zeros_(model.pointer_head.p_gen_linear.weight)
+            nn.init.zeros_(model.pointer_head.p_gen_linear.bias)
+        print("  Pointer head p_gen_linear reset to zero (broken sigmoid fix)")
 
     # ── 5c. Stage setup + LoRA — applied AFTER checkpoint load ────────────────
     lora_applied = False
@@ -1145,6 +1175,7 @@ def train():
                         pred = generate_summary(
                             model, aligned_mem, enc_attn, tokenizer,
                             device, max_new_tokens=200, beam_size=4,
+                            scene_count=inp.size(1), triplets=trip,
                         )
                     ref  = tokenizer.decode(
                         tgt[0, 0].cpu().tolist(), skip_special_tokens=True
