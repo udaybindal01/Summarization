@@ -243,20 +243,12 @@ class MovieHypergraphDataset(Dataset):
         3. SVO subjects/objects (graph_triplets) — broader fallback
     """
 
+    # Minimal stop set: only pronouns / determiners that are never entity names.
+    # All other filtering is frequency-based (see _build_movie_graph).
     _STOP = frozenset({
-        # Pronouns and determiners
-        "man", "woman", "him", "her", "he", "she", "they", "them",
-        "it", "one", "two", "other", "others", "that", "this", "i",
-        "we", "you", "who", "what", "guy", "person", "people", "men",
-        "women", "boy", "girl", "kid", "kids", "everyone", "someone",
-        "anyone", "nobody", "somebody", "nothing", "everything",
-        # Generic objects/places that appear in most scenes (cause dense incidence)
-        "car", "door", "room", "house", "gun", "phone", "table", "hand",
-        "night", "day", "time", "way", "thing", "place", "home", "street",
-        "office", "bar", "money", "world", "body", "head", "face", "eyes",
-        "back", "life", "death", "water", "blood", "floor", "wall", "bed",
-        "side", "end", "part", "case", "lot", "wife", "husband", "father",
-        "mother", "son", "daughter", "brother", "sister", "friend", "baby",
+        "him", "her", "he", "she", "they", "them", "it", "i",
+        "we", "you", "who", "what", "that", "this", "me", "my",
+        "his", "its", "our", "your", "their", "the", "an",
     })
 
     def __init__(self, scene_dataset, max_scenes=MAX_SCENES,
@@ -316,6 +308,10 @@ class MovieHypergraphDataset(Dataset):
 
     # ── Main item builder ──────────────────────────────────────────────────
 
+    # Frequency thresholds for automatic filtering (fraction of total scenes)
+    _MAX_SCENE_FRAC = 0.50   # entities in >50% of scenes are generic noise
+    _MIN_SCENES     = 1      # entities in only 1 scene are kept (may be important cameos)
+
     def __getitem__(self, idx):
         movie_name = self.movie_names[idx]
 
@@ -335,15 +331,44 @@ class MovieHypergraphDataset(Dataset):
         scenes     = [self.scene_dataset[i] for i in sel]
         num_scenes = len(scenes)
 
-        # ── Build entity registry (capped at N) ──────────────────────────
-        entity_to_idx = {}   # name → int index
-        entity_types  = []   # list of type_id ints
+        # ── Pass 1: collect all entity mentions per scene ────────────────
+        per_scene_ents = []   # list of {name → type_str} per scene
+        all_names      = {}   # name → type_str (first-seen type wins)
+        scene_count    = {}   # name → number of scenes this entity appears in
 
         for scene in scenes:
-            for name, etype in self._scene_entities(scene).items():
-                if name not in entity_to_idx and len(entity_to_idx) < N:
-                    entity_to_idx[name] = len(entity_to_idx)
-                    entity_types.append(ENTITY_TYPE_MAP.get(etype, 4))
+            ents = self._scene_entities(scene)
+            per_scene_ents.append(ents)
+            for name, etype in ents.items():
+                all_names.setdefault(name, etype)
+                scene_count[name] = scene_count.get(name, 0) + 1
+
+        # ── Pass 2: frequency-based filtering ────────────────────────────
+        # Remove entities appearing in too many scenes (generic nouns)
+        max_allowed = max(3, int(self._MAX_SCENE_FRAC * num_scenes))
+        # NER entities (PERSON, ORG, GPE, FACILITY) bypass the upper filter
+        # because a protagonist appearing in 80% of scenes is correct.
+        _NER_TYPES = {"PERSON", "ORG", "GPE", "FACILITY"}
+        keep = {}
+        for name, etype in all_names.items():
+            sc = scene_count[name]
+            if sc < self._MIN_SCENES:
+                continue
+            if sc > max_allowed and etype not in _NER_TYPES:
+                continue   # generic noun like "car" / "door"
+            keep[name] = etype
+
+        # ── Build entity registry: prioritize by scene count ─────────────
+        # Entities appearing in more scenes are more important to the narrative.
+        sorted_ents = sorted(keep.items(), key=lambda x: scene_count[x[0]], reverse=True)
+
+        entity_to_idx = {}
+        entity_types  = []
+        for name, etype in sorted_ents:
+            if len(entity_to_idx) >= N:
+                break
+            entity_to_idx[name] = len(entity_to_idx)
+            entity_types.append(ENTITY_TYPE_MAP.get(etype, 4))
 
         n_valid = len(entity_to_idx)
 
@@ -354,35 +379,31 @@ class MovieHypergraphDataset(Dataset):
         entity_mask = torch.zeros(N, dtype=torch.bool)
         entity_mask[:n_valid] = True
 
-        # Incidence matrix B [N, S]
-        # Incidence matrix B [N, S] - NOW USING HIERARCHICAL FLOAT ROLE WEIGHTS
+        # Incidence matrix B [N, S] with hierarchical role weights
         incidence = torch.zeros(N, S, dtype=torch.float)
         for s, scene in enumerate(scenes):
-            # Characters from the XML <character> tags
             speakers = [c.upper() for c in scene.get("characters", [])]
             triplets = scene.get("graph_triplets", [])
-            
-            for name in self._scene_entities(scene):
-                if name in entity_to_idx:
-                    n_idx = entity_to_idx[name]
-                    name_upper = name.upper()
-                    name_lower = name.lower()
-                    
-                    # Determine narrative hierarchy for the 3-Stream Graph
-                    if name_upper in speakers:
-                        weight = 1.0  # Main active speaker
-                    elif any(trip.lower().startswith(name_lower + "_") for trip in triplets):
-                        weight = 0.7  # Active subject in action (e.g., Joker_shoot_gun)
-                    elif any(trip.lower().endswith("_" + name_lower) for trip in triplets):
-                        weight = 0.5  # Passive object in action (e.g., Batman_punch_Joker)
-                    else:
-                        weight = 0.3  # Background presence / merely mentioned
-                        
-                    incidence[n_idx, s] = weight
 
-        # Hyperedge types [S] - DEPRECATED BY LATENT EDGES
-        # We fill with 4 (NEUTRAL) to maintain backwards compatibility with the sum.py forward signature,
-        # but the model now dynamically generates latent edges ignoring this completely.
+            for name in per_scene_ents[s]:
+                if name not in entity_to_idx:
+                    continue
+                n_idx = entity_to_idx[name]
+                name_upper = name.upper()
+                name_lower = name.lower()
+
+                if name_upper in speakers:
+                    weight = 1.0   # active speaker
+                elif any(trip.lower().startswith(name_lower + "_") for trip in triplets):
+                    weight = 0.7   # SVO subject
+                elif any(trip.lower().endswith("_" + name_lower) for trip in triplets):
+                    weight = 0.5   # SVO object
+                else:
+                    weight = 0.3   # background mention
+
+                incidence[n_idx, s] = weight
+
+        # Hyperedge types [S] — legacy, always NEUTRAL (latent edges in model)
         edge_type_ids = torch.full((S,), 4, dtype=torch.long)
         for s, scene in enumerate(scenes):
             htype = scene.get("hyperedge_type", "NEUTRAL")
@@ -390,8 +411,8 @@ class MovieHypergraphDataset(Dataset):
 
         # Invert entity_to_idx to get ordered name list for visualization
         entity_names = [""] * N
-        for name, idx in entity_to_idx.items():
-            entity_names[idx] = name
+        for name, eidx in entity_to_idx.items():
+            entity_names[eidx] = name
 
         result = {
             "movie_name":       movie_name,
