@@ -711,6 +711,10 @@ class EntitySceneCrossAttention(nn.Module):
             nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(d_model * 2, d_model), nn.Dropout(dropout),
         )
+        # LayerScale: scene residual from entity cross-attention starts at 0.
+        # Entity states are random-init — without this, random H_nodes corrupt
+        # the LED scene representations and inflate loss at the start of training.
+        self.scene_ls = nn.Parameter(torch.zeros(d_model))
 
     def forward(self, H_scenes, H_nodes, entity_mask):
         norm_s = self.norm_scene_1(H_scenes)
@@ -724,7 +728,9 @@ class EntitySceneCrossAttention(nn.Module):
             query=norm_s, key=norm_n, value=norm_n,
             key_padding_mask=key_pad_nodes,
         )
-        H_scenes = H_scenes + s_star
+        # Scale starts at 0 — no entity influence at init, grows as entity
+        # states become meaningful during training.
+        H_scenes = H_scenes + self.scene_ls * s_star
         H_scenes = H_scenes + self.ff_scene(self.norm_scene_2(H_scenes))
 
         n_star, _ = self.attn_node_to_scene(
@@ -771,8 +777,13 @@ class LEDMambaHypergraphSummariser(nn.Module):
         for p in self.head.parameters():
             p.requires_grad = True
 
-        # Scene boundary pooling: map LED token output → scene-level reps
+        # Scene boundary pooling: map LED token output → scene-level reps.
+        # Identity init: preserves pretrained LED representations at step 0.
+        # A random-init linear here scrambles the encoder output and causes
+        # the pretrained decoder to make confidently wrong predictions (loss >> 10).
         self.scene_pool_proj = nn.Linear(d_model, d_model)
+        nn.init.eye_(self.scene_pool_proj.weight)
+        nn.init.zeros_(self.scene_pool_proj.bias)
         self.scene_pool_norm = nn.LayerNorm(d_model)
 
         # ── Tower 2: Hypergraph with Mamba ─────────────────────────────
