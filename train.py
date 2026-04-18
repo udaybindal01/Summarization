@@ -10,6 +10,7 @@ Key changes from v3:
   - dt value logging for narrative turning point interpretability
 """
 
+import gc
 import torch
 import json
 import os
@@ -119,7 +120,7 @@ LR_DECODER         = 2e-5  # lower LR for pretrained LED decoder
 LR_LORA            = 1e-5
 MAX_INPUT_TOKENS   = 16384  # LED max input
 MAX_TARGET_TOKENS  = 256   # summaries avg ~120 words; 512 wasted decoder memory
-MAX_SCENES         = 96    # was 64; GPU has ~32GB free so use it
+MAX_SCENES         = 64    # reverted from 96: keep headroom for eval generation
 
 
 # =============================================================================
@@ -751,9 +752,17 @@ def train():
         start_epoch = ckpt_state.get("epoch", 0)
 
     # ── 5a. Xavier init for new layers ────────────────────────────────────────
-    _skip = {"led_encoder", "led_decoder", "head"}
+    # Skip layers that have carefully-crafted special inits in sum.py.__init__
+    # (identity, zero, or biased) to avoid clobbering them on fresh starts.
+    _skip_xavier = {
+        "led_encoder", "led_decoder", "head",
+        "scene_pool_proj",           # identity init
+        "graph_text_fusion.ff",      # zero-init output
+        "entity_scene_attn.ff_scene",# zero-init output
+        "entity_scene_attn.ff_node", # zero-init output
+    }
     for name, param in model.named_parameters():
-        if param.requires_grad and not any(s in name for s in _skip):
+        if param.requires_grad and not any(s in name for s in _skip_xavier):
             if len(param.shape) > 1:
                 torch.nn.init.xavier_uniform_(param)
 
@@ -869,6 +878,20 @@ def train():
         optimizer, num_warmup_steps=warmup_steps,
         num_training_steps=total_steps,
     )
+
+    # Restore optimizer + scheduler state so Adam moments carry over between runs
+    if ckpt_state and "optimizer_state_dict" in ckpt_state:
+        try:
+            optimizer.load_state_dict(ckpt_state["optimizer_state_dict"])
+            print("  Optimizer state restored from checkpoint.")
+        except Exception as e:
+            print(f"  Could not restore optimizer state ({e}), starting fresh.")
+    if ckpt_state and "scheduler_state_dict" in ckpt_state:
+        try:
+            scheduler.load_state_dict(ckpt_state["scheduler_state_dict"])
+            print("  Scheduler state restored from checkpoint.")
+        except Exception as e:
+            print(f"  Could not restore scheduler state ({e}), starting fresh.")
 
     # ── 8. Evaluation metrics ─────────────────────────────────────────────────
     rouge_metric     = hf_evaluate.load("rouge")
@@ -1015,10 +1038,13 @@ def train():
             lr_now = optimizer.param_groups[0]["lr"]
             bar.set_postfix(loss=f"{val:.4f}", lr=f"{lr_now:.2e}")
             wandb.log({
-                "train/batch_loss": val,
-                "train/lr":         lr_now,
-                "train/alpha":      criterion.alpha,
-                "epoch":            epoch + 1,
+                "train/batch_loss":  val,
+                "train/lm_loss":     getattr(criterion, "_last_lm_loss",   0.0),
+                "train/cont_loss":   getattr(criterion, "_last_cont_loss",  0.0),
+                "train/coh_loss":    getattr(criterion, "_last_coh_loss",   0.0),
+                "train/lr":          lr_now,
+                "train/alpha":       criterion.alpha,
+                "epoch":             epoch + 1,
             })
 
         avg_train = train_loss_sum / max(n_valid_batches, 1)
@@ -1030,6 +1056,12 @@ def train():
         hg_entities_per_scene = []
         hg_scenes_per_entity  = []
         hg_entity_coverage    = []
+
+        # Buffer for post-loop generation: collect (cpu tensors, ref text) for
+        # up to GEN_SAMPLES movies so generation happens after full cache flush.
+        GEN_SAMPLES  = 5
+        gen_buffer   = []   # list of dicts with CPU tensors
+        hg_viz_batch = None # first eval batch for hypergraph visualisation
 
         bar_e = tqdm(eval_dl, desc=f"E{epoch+1} Eval", unit="batch")
         with torch.no_grad():
@@ -1099,78 +1131,115 @@ def train():
                     wandb.log({"eval/fusion_gate_mean": model._last_gate_mean,
                                "epoch": epoch + 1})
 
-                # Generation every 10th batch
-                if bi % 10 == 0:
-                    # Free eval loss tensors before re-running encoder for generation
-                    # — both passes would otherwise overlap in memory and OOM.
-                    try:
-                        del log_pr, H_text, labels, H_hyp
-                    except NameError:
-                        pass
-                    torch.cuda.empty_cache()
+                # Stash first batch for hypergraph viz (after loop, GPU clear)
+                if bi == 0:
+                    hg_viz_batch = {
+                        "inc_cpu":  inc[0].cpu(),
+                        "enid_cpu": enid[0].cpu(),
+                        "emk_cpu":  emk[0].cpu(),
+                        "enames":   enames,
+                        "mname":    (batch["movie_name"][0]
+                                     if batch.get("movie_name") else ""),
+                    }
 
-                    S_count = sbnds.size(1)
-                    try:
-                        aligned_mem, _, __, dt_vals = model(
-                            inp, amsk, sbnds, gattn,
-                            inc, etid, enid, emk,
-                            entity_names=enames, emotion_matrix=emot, return_dt=True,
-                        )
-                    except torch.OutOfMemoryError:
-                        print(f"  ⚠ OOM during eval generation at batch {bi}, skipping")
-                        torch.cuda.empty_cache()
-                        continue
-
-                    mem_pad = torch.zeros(aligned_mem.size(0), aligned_mem.size(1),
-                                          dtype=torch.bool, device=device)
-                    for b_idx in range(aligned_mem.size(0)):
-                        for s in range(S_count):
-                            start, end = sbnds[b_idx, s].tolist()
-                            if start >= end:
-                                mem_pad[b_idx, s] = True
-                    mem_pad[:, S_count:] = ~emk
-                    all_masked = mem_pad.all(dim=1)
-                    mem_pad[all_masked, 0] = False
-                    enc_attn = (~mem_pad).long()
-
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        pred = generate_summary(
-                            model, aligned_mem, enc_attn, tokenizer,
-                            device, max_new_tokens=200, beam_size=4,
-                        )
-                    ref = tokenizer.decode(tgt[0].cpu().tolist(),
-                                           skip_special_tokens=True)
-                    all_preds.append(pred)
-                    all_refs.append(ref)
-                    wandb.log({
-                        "eval/sample": wandb.Html(
-                            f"<b>Pred:</b> {pred}<br><b>Ref:</b> {ref}"),
-                        "epoch": epoch + 1,
+                # Collect CPU-pinned tensors for post-loop generation (no GPU overlap)
+                if len(gen_buffer) < GEN_SAMPLES:
+                    gen_buffer.append({
+                        "inp":    inp.cpu(),
+                        "amsk":   amsk.cpu(),
+                        "gattn":  gattn.cpu(),
+                        "sbnds":  sbnds.cpu(),
+                        "inc":    inc.cpu(),
+                        "etid":   etid.cpu(),
+                        "enid":   enid.cpu(),
+                        "emk":    emk.cpu(),
+                        "emot":   emot.cpu(),
+                        "ref":    tokenizer.decode(tgt[0].cpu().tolist(),
+                                                   skip_special_tokens=True),
+                        "enames": enames,
                     })
 
-                    # dt heatmap (first batch of each epoch)
-                    if bi == 0 and dt_vals is not None:
-                        _mname = batch["movie_name"][0] if batch.get("movie_name") else ""
-                        log_entity_dt_heatmap(dt_vals, enames, emk, _mname)
-
-                    if bi % 50 == 0:
-                        _mname = batch["movie_name"][0] if batch.get("movie_name") else ""
-                        log_hyperedge_attention(model, H_hyp, inc, _mname)
-
-                    if bi == 0:
-                        _mname = batch["movie_name"][0] if batch.get("movie_name") else ""
-                        _enames = batch["entity_names"][0] if batch.get("entity_names") else []
-                        _save = f"/tmp/uday/hypergraph_epoch{epoch+1}.png"
-                        log_hypergraph_to_wandb(
-                            inc[0].cpu(), _enames,
-                            entity_type_ids=enid[0].cpu(),
-                            entity_mask=emk[0].cpu(),
-                            movie_name=_mname,
-                            step=epoch + 1,
-                            save_path=_save,
-                        )
-
         avg_eval = eval_loss_sum / max(len(eval_dl), 1)
+
+        # ── Post-eval generation (GPU fully cleared before second forward pass) ──
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        model.eval()
+        with torch.no_grad():
+            # Hypergraph viz for epoch (uses first batch tensors, already on CPU)
+            if hg_viz_batch is not None:
+                _save = f"/tmp/uday/hypergraph_epoch{epoch+1}.png"
+                log_hypergraph_to_wandb(
+                    hg_viz_batch["inc_cpu"],
+                    hg_viz_batch["enames"][0] if hg_viz_batch["enames"] else [],
+                    entity_type_ids=hg_viz_batch["enid_cpu"],
+                    entity_mask=hg_viz_batch["emk_cpu"],
+                    movie_name=hg_viz_batch["mname"],
+                    step=epoch + 1,
+                    save_path=_save,
+                )
+
+            for gi, gb in enumerate(gen_buffer):
+                g_inp   = gb["inp"].to(device)
+                g_amsk  = gb["amsk"].to(device)
+                g_gattn = gb["gattn"].to(device)
+                g_sbnds = gb["sbnds"].to(device)
+                g_inc   = gb["inc"].to(device)
+                g_etid  = gb["etid"].to(device)
+                g_enid  = gb["enid"].to(device)
+                g_emk   = gb["emk"].to(device)
+                g_emot  = gb["emot"].to(device)
+                try:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        aligned_mem, _, __, dt_vals = model(
+                            g_inp, g_amsk, g_sbnds, g_gattn,
+                            g_inc, g_etid, g_enid, g_emk,
+                            entity_names=gb["enames"],
+                            emotion_matrix=g_emot,
+                            return_dt=True,
+                        )
+                except torch.OutOfMemoryError:
+                    print(f"  ⚠ OOM during post-eval generation sample {gi}, skipping")
+                    torch.cuda.empty_cache()
+                    continue
+
+                S_count = g_sbnds.size(1)
+                mem_pad = torch.zeros(aligned_mem.size(0), aligned_mem.size(1),
+                                      dtype=torch.bool, device=device)
+                for s in range(S_count):
+                    start, end = g_sbnds[0, s].tolist()
+                    if start >= end:
+                        mem_pad[0, s] = True
+                mem_pad[:, S_count:] = ~g_emk
+                all_masked = mem_pad.all(dim=1)
+                mem_pad[all_masked, 0] = False
+                enc_attn = (~mem_pad).long()
+
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    pred = generate_summary(
+                        model, aligned_mem, enc_attn, tokenizer,
+                        device, max_new_tokens=200, beam_size=4,
+                    )
+                all_preds.append(pred)
+                all_refs.append(gb["ref"])
+                wandb.log({
+                    "eval/sample": wandb.Html(
+                        f"<b>Pred:</b> {pred}<br><b>Ref:</b> {gb['ref']}"),
+                    "epoch": epoch + 1,
+                })
+
+                # dt heatmap for first generated sample
+                if gi == 0 and dt_vals is not None:
+                    _mname = hg_viz_batch["mname"] if hg_viz_batch else ""
+                    log_entity_dt_heatmap(dt_vals, gb["enames"], g_emk, _mname)
+
+                # Free generation tensors before next sample
+                del aligned_mem, dt_vals, enc_attn, mem_pad
+                del g_inp, g_amsk, g_gattn, g_sbnds, g_inc, g_etid, g_enid, g_emk, g_emot
+                torch.cuda.empty_cache()
+
+        _gc.collect()
 
         # ── Metrics ───────────────────────────────────────────────────────────
         r1 = r2 = rL = met = ent_f1 = 0.0
@@ -1215,8 +1284,12 @@ def train():
             "train_loss": avg_train, "eval_loss": avg_eval,
             "rouge1": r1, "rouge2": r2, "rougeL": rL,
         }, ckpt_ep)
-        torch.save({"epoch": epoch + 1, "model_state_dict": model.state_dict()},
-                   ckpt_latest)
+        torch.save({
+            "epoch":                epoch + 1,
+            "model_state_dict":     model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+        }, ckpt_latest)
         print(f"  Checkpoint saved → {ckpt_ep}")
 
     wandb.finish()

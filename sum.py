@@ -50,7 +50,7 @@ ENTITY_TYPE_MAP     = {"PERSON": 0, "ORG": 1, "GPE": 2, "FACILITY": 3, "OTHER": 
 NUM_ENTITY_TYPES    = 5
 HYPEREDGE_TYPE_MAP  = {"CONFLICT": 0, "ALLIANCE": 1, "DECEPTION": 2, "DIALOGUE": 3, "NEUTRAL": 4}
 NUM_HYPEREDGE_TYPES = 5
-MAX_ENTITIES = 150
+MAX_ENTITIES = 100
 
 
 # =============================================================================
@@ -572,6 +572,10 @@ class RelationalEventConsistencyLoss(nn.Module):
                     weight_mask[torch.isin(targets, ent_t)] = self.entity_penalty
 
         lm_loss = self._smooth_nll(log_probs, targets, weight_mask)
+        # Store for external logging without affecting the graph
+        self._last_lm_loss   = lm_loss.item()
+        self._last_cont_loss = 0.0
+        self._last_coh_loss  = 0.0
 
         if (not triplets or not triplets[0] or hidden_states is None
                 or head_weight is None):
@@ -607,10 +611,12 @@ class RelationalEventConsistencyLoss(nn.Module):
         cont_loss = F.cross_entropy(
             logits_c, torch.zeros(n, dtype=torch.long, device=device))
         total = (1 - self.alpha) * lm_loss + self.alpha * cont_loss
+        self._last_cont_loss = cont_loss.item()
 
         if incidence_matrix is not None and self.coherence_weight > 0:
             coh = self.coherence_fn(hidden_states, incidence_matrix)
             total = total + self.coherence_weight * coh
+            self._last_coh_loss = coh.item()
         return total
 
 
