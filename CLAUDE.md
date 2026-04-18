@@ -4,48 +4,46 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **Dual-Tower Dynamic Hypergraph Summariser (v3)** for screenplay/movie summarization. It processes movies scene-by-scene, builds a dynamic hypergraph over entity states, and generates summaries using a BART-based decoder fused with Mamba-style scene encoding.
+This is a **LED + Mamba-Hypergraph Narrative Summariser (v5)** for screenplay/movie summarization. It uses a LED encoder for long-context text processing (16K tokens), a dynamic hypergraph with **LED-grounded entity initialization** and **per-entity Mamba SSM trajectories** for tracking character state evolution, and a LED decoder for generation.
 
 Primary dataset: **MovieSum** (~2,200 movies). Secondary: **MENSA** (~500 movies). MovieSum-trained models are also evaluated zero-shot on MENSA.
 
 ## Pipeline Stages
 
 ### 1. Data Extraction (`emnlp_extractor.py`)
-Converts raw MENSA/MovieSum HuggingFace datasets into compressed JSONL feature files.
+Converts raw MENSA/MovieSum HuggingFace datasets into compressed JSONL feature files. Includes:
+- `clean_text` and `summary_text` for LED re-tokenization
+- **Movie-level coreference resolution** via fastcoref — groups mention chains (e.g., "the detective", "John", "he") into canonical entity names stored as `coref_entities` per scene.
 
 ```bash
 python emnlp_extractor.py --dataset mensa --out /tmp/uday/mensa_train_data.jsonl.gz
 python emnlp_extractor.py --dataset moviesum --out /tmp/uday/moviesum_data.jsonl.gz
-python emnlp_extractor.py --start 0 --end 5000 --out /tmp/uday/shard_0.jsonl.gz  # sharded
 ```
 
 ### 2. Training (`train.py`)
 ```bash
 # Full model training (MovieSum by default)
-python train.py --run_name full_model
+python train.py --run_name full_model_v5
 
-# Ablation flags
-python train.py --run_name ablation_no_hypergraph   --no_hypergraph       # text-only baseline
-python train.py --run_name ablation_static          --static_hypergraph   # DiscoGraMS-style baseline
-python train.py --run_name ablation_no_gru          --no_gru              # EMA instead of GRU updates
-python train.py --run_name ablation_no_raft         --no_raft             # no cross-modal fusion
-python train.py --run_name ablation_no_pointer      --no_pointer_head
-python train.py --run_name ablation_no_coherence    --no_coherence_loss
-python train.py --run_name ablation_no_contrastive  --no_contrastive_loss
-python train.py --run_name ablation_global_streams  --no_adaptive_streams   # v4: global vs adaptive
-python train.py --run_name ablation_no_names        --no_entity_names       # v4: no entity name init
-python train.py --run_name ablation_no_edgedrop     --edge_dropout 0.0      # v4: no graph dropout
-python train.py --run_name discograms_baseline      --static_hypergraph --no_gru  # paper baseline
+# Key ablation flags
+python train.py --run_name led_only          --no_hypergraph        # LED-only baseline
+python train.py --run_name static_graph      --static_hypergraph    # static graph baseline
+python train.py --run_name no_mamba_entity   --no_mamba_entity      # GRU instead of Mamba (ablation)
+python train.py --run_name no_coherence      --no_coherence_loss
+python train.py --run_name no_contrastive    --no_contrastive_loss
+python train.py --run_name global_streams    --no_adaptive_streams
+python train.py --run_name no_names          --no_entity_names
+python train.py --run_name no_edgedrop       --edge_dropout 0.0
 
 # Key flags
---d_model 1024          # must match BART variant (1024=large, 768=base)
---num_layers 4          # number of MambaBlock layers
+--d_model 1024          # must match LED variant (1024=large)
+--mamba_layers 2        # number of EntityMamba layers for temporal dynamics
 --entity_penalty 3.0    # weight for entity consistency loss term
 --dataset moviesum|mensa|both
 --edge_dropout 0.1      # incidence matrix edge dropout (0 = disabled)
 ```
 
-Checkpoints: `/tmp/uday/checkpoints/`. Split files: `/tmp/uday/train_{run_name}.jsonl` and `eval_{run_name}.jsonl`.
+Checkpoints: `/tmp/uday/checkpoints/led_mamba_*.pt`. Split files: `/tmp/uday/train_{run_name}.jsonl` and `eval_{run_name}.jsonl`.
 
 ### 3. Inference (`inference.py`)
 ```bash
@@ -68,62 +66,75 @@ plot_movie_hypergraph(incidence_matrix, entity_names, movie_name="...", save_pat
 
 ## Architecture (`sum.py`)
 
-**`DualTowerHypergraphSummariser`** is the main model class with two towers fused via cross-attention.
+**`LEDMambaHypergraphSummariser`** is the main model class.
 
-### Tower 1 — Text Stream
-`Frozen RoBERTa (768d) → scene_proj (768→d_model) → MambaBlock → RaftConsensusAttentionV2`
+### Tower 1 — Text Stream (LED encoder)
+`Full screenplay (16K tokens) → LED encoder → scene boundary pooling → H_text [B, S, d_model]`
 
-- **MambaBlock**: Stack of `num_layers` selective SSM layers with no token-level graph routing (removed in v2 due to O(seq²) OOM).
-- **RaftConsensusAttentionV2**: Cross-modal attention across 4 modalities (action, dialogue, entity, header) with gated consensus fusion. Output: `H_text [B, S, L, d_model]`.
-- LoRA (Stage 2) targets Mamba's `in_proj`, `x_proj`, `out_proj`, `dt_proj`. RoBERTa is always frozen.
+- LED encoder handles full screenplay as one sequence with `</s>` scene separators
+- Global attention on separator tokens and BOS for cross-scene reasoning
+- LED encoder frozen in Stage 1; global attention layers unfrozen in Stage 2
+- Scene-level representations extracted via boundary pooling
 
-### Tower 2 — Dynamic 3-Stream Hypergraph (DHEG)
-`DynamicHypergraphTower` processes entities sequentially across scenes using an incidence matrix with **float role weights** (not binary):
+### Tower 2 — Dynamic 3-Stream Hypergraph with LED-grounded init + Mamba Temporal Dynamics
+`DynamicHypergraphTower` with **EntityMambaBlock** for temporal entity state tracking.
+
+**LED-grounded entity initialization**: Entity states initialized by pooling LED encoder scene representations weighted by incidence roles (not random embeddings). Combined with type embeddings and optional name embeddings.
+
+Incidence matrix uses **float role weights** (not binary):
 - `1.0` = active speaker, `0.7` = SVO subject, `0.5` = SVO object, `0.3` = background mention
 
-Three message streams per scene, fused via learnable softmax weights:
-1. **Scene stream**: What is happening in this scene (from latent hyperedge).
-2. **Arc stream**: Historical context from past scenes sharing these entities (temporal decay).
-3. **Interaction stream**: Social context from co-occurring entities (role-weighted co-occurrence).
+Three message streams per scene, fused via scene-conditioned adaptive gating:
+1. **Scene stream**: Entity-aware bilinear attention — each entity extracts different information from the scene based on its identity.
+2. **Arc stream**: Attention over past shared hyperedges with learnable keys/values and temporal decay bias.
+3. **Interaction stream**: Social context from co-occurring entities.
 
-Entity states updated via `GRUCell` only for entities present in the current scene. `edge_type_ids` (hardcoded `NEUTRAL`) are kept for API compatibility but **ignored** — edges are fully latent.
+**Key novelty**: 
+- Entity states grounded in LED encoder output (not random init)
+- Entity-aware scene messages via bilinear attention (not broadcast)
+- Temporal dynamics via per-entity Mamba SSM trajectories
+- Coreference-resolved entity nodes (from extractor)
+- **dt values are interpretable** as state change magnitude → automatic narrative turning point detection
 
-### Fusion
-Deep cross-attention over `[H_text_pooled, H_hyperedges, h_entities]` → BART decoder.
+LoRA (Stage 2) targets entity Mamba's `in_proj`, `x_proj`, `out_proj`, `dt_proj`.
+
+### Fusion & Decoder
+- Gated fusion: `gate * H_text + (1-gate) * H_hyperedges`
+- CrossAttentionAdapter: bidirectional cross-attention between scenes and entity nodes
+- LED decoder: fully trainable, matched to LED encoder (no distribution mismatch)
+- No pointer head — LED decoder handles entity name generation natively
 
 ### Losses
 - `RelationalEventConsistencyLoss`: label-smoothed entity NLL, weighted by `--entity_penalty`.
-- `NarrativeCoherenceLoss`: scene-pair NT-Xent where positive pairs = scenes with Jaccard similarity > 0.25 in the incidence matrix (entities in common).
+- `NarrativeCoherenceLoss`: scene-pair NT-Xent where positive pairs = scenes with Jaccard similarity > 0.25.
 
 ## Data Format
 
 Each line in `.jsonl.gz` files is a single scene:
 - `movie_id`: `"MovieName_Scene_NNN"`
-- `input_ids`, `target_ids`: RoBERTa-tokenized, padded to `max_seq_len` (256 in v3, was 512)
-- `action_mask`, `dialogue_mask`, `entity_mask`, `header_mask`: 4-way modality masks (bool)
-- `graph_triplets`: list of `"Subject_Verb_Object"` strings (negation prefixed with `"NOT "`)
+- `input_ids`, `target_ids`: BART-tokenized (legacy, used as fallback)
+- `clean_text`: raw scene text (for LED re-tokenization)
+- `summary_text`: raw summary text (for LED re-tokenization)
+- `coref_entities`: dict mapping mention → canonical entity name (from fastcoref)
+- `action_mask`, `dialogue_mask`, `entity_mask`, `header_mask`: 4-way modality masks
+- `graph_triplets`: list of `"Subject_Verb_Object"` strings
 - `characters`: speaker names from screenplay ALL-CAPS tags
 - `ner_entities`: list of `{text, type}` dicts (NER output)
-- `hyperedge_type`: dominant scene type string (deprecated; model uses latent edges)
 - `character_emotions`: dict of character → float polarity
-- `scene_meta`: `{dialogue_density, action_density, has_int, has_ext}`
+- `scene_meta`: `{dialogue_density, action_density}`
 
-**`MovieHypergraphDataset`** groups scenes by movie and builds per-movie tensors:
-- `incidence_matrix [MAX_ENTITIES=100, MAX_SCENES=64]` float — role-weighted
-- `entity_type_ids [100]` long — from `ENTITY_TYPE_MAP` (PERSON/ORG/GPE/FACILITY/OTHER)
-- `edge_type_ids [64]` long — legacy; always `NEUTRAL` (4)
-- `entity_mask [100]` bool
-
-Entity registry priority per scene: NER entities > speaker names > SVO subjects/objects. Movies with >64 scenes are stride-sampled.
-
-**`SceneDataset`** requires **uncompressed** `.jsonl` — uses byte-offset seeking for O(1) random access. The source `.jsonl.gz` stays compressed; `split_dataset_by_movie()` inflates it into per-split plain `.jsonl` files. If you see a `ValueError` about `.gz` files, delete old `.gz` split files and re-run.
+**`MovieHypergraphDataset`** groups scenes by movie and:
+1. Concatenates all scene texts with `</s>` separator for LED (up to 16384 tokens)
+2. Records scene boundary positions for pooling LED output
+3. Builds hypergraph incidence matrix from entity mentions (with coref resolution)
+4. Collects per-scene triplets (used in loss, not model)
 
 ## Key Paths (hardcoded)
 
 | Path | Purpose |
 |------|---------|
 | `/tmp/uday/` | Main data and checkpoints directory |
-| `/tmp/uday/bart-large` | Local BART-large weights (checked before HF hub) |
+| `/tmp/uday/led-large-16384` | Local LED-large weights (checked before HF hub) |
 | `/tmp/uday/moviesum_data.jsonl.gz` | Primary training data |
 | `/tmp/uday/mensa_train_data.jsonl.gz` | Secondary training data |
 | `/tmp/uday/mensa_test_data.jsonl.gz` | Test data |
@@ -131,9 +142,9 @@ Entity registry priority per scene: NER entities > speaker names > SVO subjects/
 
 ## Training Stages
 
-- **Stage 1** (2 epochs): RoBERTa + Mamba frozen; train hypergraph tower + decoder. LR=1e-4.
-- **Stage 2** (20 epochs): LoRA on Mamba; full model except frozen RoBERTa. LR=1e-5.
-- Evaluation every epoch: ROUGE + BERTScore + METEOR + entity F1.
+- **Stage 1** (3 epochs): LED encoder frozen; train hypergraph tower + LED decoder + fusion. LR=1e-4 (new layers), 2e-5 (LED decoder).
+- **Stage 2** (20 epochs): LoRA on entity Mamba; LED encoder global attention unfrozen. LR=1e-5 (LoRA).
+- Evaluation every epoch: ROUGE + METEOR + entity F1 + dt heatmaps.
 
 ## Dependencies
 
@@ -143,4 +154,12 @@ Sentiment model: `cardiffnlp/twitter-roberta-base-sentiment-latest`
 
 ## Ablation System
 
-All components are ablation-switchable via `ABLATION` dict in `train.py`. Each `--no_*` / `--static_*` flag disables one component. Use `--run_name` to distinguish W&B runs and output split files. Stream weight logs (`stream_weight/scene`, `stream_weight/arc`, `stream_weight/interaction`) in W&B show which hypergraph streams the model relies on.
+All components are ablation-switchable via `ABLATION` dict in `train.py`. Each `--no_*` / `--static_*` flag disables one component. Use `--run_name` to distinguish W&B runs and output split files.
+
+Key ablation comparisons for the paper:
+1. LED-only (no hypergraph) — shows hypergraph contribution
+2. LED + static graph — shows dynamic updates matter
+3. LED + GRU updates — shows Mamba > GRU for temporal dynamics
+4. LED + Mamba (full) — full model
+
+Stream weight logs and **entity dt heatmaps** in W&B show which streams the model relies on and when entity states change significantly.

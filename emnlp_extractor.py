@@ -19,6 +19,7 @@ import gzip
 import os
 import warnings
 import argparse
+from collections import defaultdict
 from tqdm import tqdm
 from transformers import (
     AutoTokenizer,
@@ -26,6 +27,7 @@ from transformers import (
     logging as hf_logging,
 )
 from datasets import load_dataset
+from fastcoref import spacy_component  # noqa: F401  — registers spacy pipe
 
 # ---------------------------------------------------------------------------
 # Silence known-harmless warnings
@@ -159,6 +161,103 @@ def extract_robust_characters(scene_xml, clean_text):
         official_chars.append(fallback)
         
     return sorted(list(set(official_chars)))
+
+# ---------------------------------------------------------------------------
+# Movie-level Coreference Resolution
+# ---------------------------------------------------------------------------
+
+def resolve_movie_coreferences(movie_scenes):
+    """
+    Run coreference resolution across all scenes of a movie.
+    Groups mention chains to canonical entity names, so that
+    "the detective", "John", and "he" all map to a single node.
+
+    Args:
+        movie_scenes: list of scene dicts (must have 'clean_text')
+    Returns:
+        list of scene dicts with added 'coref_entities' field:
+            dict mapping mention text → canonical entity name
+    """
+    nlp_coref = spacy.blank("en")
+    nlp_coref.add_pipe("fastcoref")
+
+    # Concatenate all scene texts with markers
+    scene_texts = []
+    scene_offsets = []  # (start_char, end_char) per scene in concatenated text
+    offset = 0
+    for scene in movie_scenes:
+        text = scene.get("clean_text", "")
+        if not text.strip():
+            text = " "
+        scene_texts.append(text)
+        scene_offsets.append((offset, offset + len(text)))
+        offset += len(text) + 1  # +1 for newline separator
+
+    full_text = "\n".join(scene_texts)
+
+    # Truncate to avoid OOM on very long movies (fastcoref handles ~10K tokens)
+    MAX_COREF_CHARS = 50000
+    full_text_trunc = full_text[:MAX_COREF_CHARS]
+
+    doc = nlp_coref(full_text_trunc)
+
+    # Build mention → canonical name mapping
+    # For each cluster, pick the longest non-pronoun mention as canonical
+    _PRONOUNS = {"he", "she", "him", "her", "his", "they", "them", "their",
+                 "it", "its", "we", "us", "our", "who", "whom", "i", "me",
+                 "my", "you", "your", "this", "that", "these", "those"}
+
+    # Extract clusters from fastcoref
+    clusters = doc._.coref_clusters if hasattr(doc._, "coref_clusters") else []
+
+    # Global mention → canonical mapping
+    mention_to_canonical = {}
+
+    for cluster in clusters:
+        # cluster is a list of (start_char, end_char) spans
+        mentions = []
+        for span_start, span_end in cluster:
+            if span_start < len(full_text_trunc):
+                mention_text = full_text_trunc[span_start:span_end].strip()
+                if mention_text:
+                    mentions.append((mention_text, span_start, span_end))
+
+        if not mentions:
+            continue
+
+        # Pick canonical: longest non-pronoun mention, prefer capitalized
+        candidates = [m for m in mentions if m[0].lower() not in _PRONOUNS]
+        if not candidates:
+            continue
+        canonical = max(candidates, key=lambda m: (
+            m[0][0].isupper() if m[0] else False,  # prefer capitalized
+            len(m[0]),                                # prefer longer
+        ))
+        canonical_name = canonical[0]
+
+        for mention_text, start, end in mentions:
+            if mention_text.lower() not in _PRONOUNS:
+                mention_to_canonical[mention_text.lower()] = canonical_name.lower()
+
+    # Map back to per-scene coref entities
+    for i, scene in enumerate(movie_scenes):
+        coref_ents = {}
+        scene_start, scene_end = scene_offsets[i]
+        if scene_start >= MAX_COREF_CHARS:
+            # Beyond truncation — no coref data
+            scene["coref_entities"] = {}
+            continue
+
+        # Check which mentions from this scene have canonical mappings
+        text = scene.get("clean_text", "")
+        for mention, canonical in mention_to_canonical.items():
+            if mention in text.lower():
+                coref_ents[mention] = canonical
+
+        scene["coref_entities"] = coref_ents
+
+    return movie_scenes
+
 
 # ---------------------------------------------------------------------------
 # Sentiment helpers (GPU, batched)
@@ -326,13 +425,15 @@ def process_scene(scene_xml, summary, scene_id,
         "movie_id":        scene_id,
         "input_ids":       input_ids,
         "target_ids":      target_ids,
+        "clean_text":      clean_text,        # raw text for LED re-tokenization
+        "summary_text":    summary,            # raw summary text for LED re-tokenization
         "action_mask":     action_mask,
         "dialogue_mask":   dialogue_mask,
         "entity_mask":     entity_mask,
         "header_mask":     header_mask,
         "graph_triplets":  triplets,
-        "characters":      extract_robust_characters(scene_xml, clean_text), 
-        "ner_entities":    ner_entities,      
+        "characters":      extract_robust_characters(scene_xml, clean_text),
+        "ner_entities":    ner_entities,
         "scene_meta": {
             "dialogue_density": round(dial_density, 4),
             "action_density":   round(act_density,  4),
@@ -417,26 +518,49 @@ def main():
 
     written = 0
     buffer  = []
+    all_extracted = []
 
+    with mp.Pool(processes=num_workers, initializer=init_worker, maxtasksperchild=50) as pool:
+        iterator = pool.imap_unordered(process_scene_wrapper, all_scenes, chunksize=32)
+
+        for pre in tqdm(iterator, total=len(all_scenes), desc="Extracting", unit="scene"):
+            if pre is not None:
+                buffer.append(pre)
+
+            if len(buffer) >= _WRITE_EVERY:
+                all_extracted.extend(
+                    attach_emotions(buffer, sent_tok, sent_model, device))
+                buffer = []
+
+        if buffer:
+            all_extracted.extend(
+                attach_emotions(buffer, sent_tok, sent_model, device))
+
+    # ── Movie-level coreference resolution ────────────────────────────────
+    print(f"\nRunning movie-level coreference resolution on {len(all_extracted):,} scenes...")
+    movie_groups = defaultdict(list)
+    for rec in all_extracted:
+        mid = rec.get("movie_id", "unknown")
+        base = mid.split("_Scene_")[0] if "_Scene_" in mid else mid
+        movie_groups[base].append(rec)
+
+    coref_scenes = []
+    for movie_name, scenes in tqdm(movie_groups.items(), desc="Coref", unit="movie"):
+        # Sort scenes by scene number for correct temporal ordering
+        scenes.sort(key=lambda r: r.get("movie_id", ""))
+        try:
+            scenes = resolve_movie_coreferences(scenes)
+        except Exception as e:
+            print(f"  Coref failed for {movie_name}: {e}")
+            for s in scenes:
+                s["coref_entities"] = {}
+        coref_scenes.extend(scenes)
+
+    # ── Write output ──────────────────────────────────────────────────────
     with gzip.open(args.out, "wt", encoding="utf-8") as out_f:
-        with mp.Pool(processes=num_workers, initializer=init_worker, maxtasksperchild=50) as pool:
-            iterator = pool.imap_unordered(process_scene_wrapper, all_scenes, chunksize=32)
-            
-            for pre in tqdm(iterator, total=len(all_scenes), desc="Extracting", unit="scene"):
-                if pre is not None:
-                    buffer.append(pre)
-
-                if len(buffer) >= _WRITE_EVERY:
-                    for rec in attach_emotions(buffer, sent_tok, sent_model, device):
-                        out_f.write(json.dumps(rec) + "\n")
-                        written += 1
-                    buffer = []
-                    out_f.flush()
-
-            if buffer:
-                for rec in attach_emotions(buffer, sent_tok, sent_model, device):
-                    out_f.write(json.dumps(rec) + "\n")
-                    written += 1
+        for rec in coref_scenes:
+            out_f.write(json.dumps(rec) + "\n")
+            written += 1
 
     print(f"\nDone — {written:,} scenes → {args.out}")
 
