@@ -27,7 +27,13 @@ from transformers import (
     logging as hf_logging,
 )
 from datasets import load_dataset
-from fastcoref import spacy_component  # noqa: F401  — registers spacy pipe
+try:
+    from fastcoref import spacy_component  # noqa: F401  — registers spacy pipe
+    FASTCOREF_AVAILABLE = True
+except ImportError:
+    FASTCOREF_AVAILABLE = False
+    print("Warning: fastcoref not installed — coreference resolution disabled. "
+          "Install with: pip install fastcoref")
 
 # ---------------------------------------------------------------------------
 # Silence known-harmless warnings
@@ -178,6 +184,12 @@ def resolve_movie_coreferences(movie_scenes):
         list of scene dicts with added 'coref_entities' field:
             dict mapping mention text → canonical entity name
     """
+    if not FASTCOREF_AVAILABLE:
+        # No coref — each scene gets an empty mapping (entities stay as-is)
+        for scene in movie_scenes:
+            scene.setdefault("coref_entities", {})
+        return movie_scenes
+
     nlp_coref = spacy.blank("en")
     nlp_coref.add_pipe("fastcoref")
 
