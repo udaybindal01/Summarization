@@ -118,7 +118,7 @@ LR_NEW_LAYERS      = 1e-4
 LR_DECODER         = 2e-5  # lower LR for pretrained LED decoder
 LR_LORA            = 1e-5
 MAX_INPUT_TOKENS   = 16384  # LED max input
-MAX_TARGET_TOKENS  = 512
+MAX_TARGET_TOKENS  = 256   # summaries avg ~120 words; 512 wasted decoder memory
 MAX_SCENES         = 64
 
 
@@ -941,23 +941,29 @@ def train():
             trip  = batch["triplets"]
             enames = batch.get("entity_names")
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                log_pr, H_text, labels, _, H_hyp = model(
-                    inp, amsk, sbnds, gattn,
-                    inc, etid, enid, emk,
-                    target_ids=tgt, entity_names=enames,
-                    emotion_matrix=emot,
-                )
-                log_pr = log_pr.float()
-                loss   = criterion(
-                    log_probs=log_pr.view(-1, log_pr.size(-1)),
-                    targets=labels.view(-1),
-                    triplets=trip[0] if trip else [],
-                    hidden_states=H_text,
-                    head_weight=model.head.weight,
-                    incidence_matrix=inc,
-                )
-                loss = loss / ACCUMULATION_STEPS
+            try:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    log_pr, H_text, labels, _, H_hyp = model(
+                        inp, amsk, sbnds, gattn,
+                        inc, etid, enid, emk,
+                        target_ids=tgt, entity_names=enames,
+                        emotion_matrix=emot,
+                    )
+                    log_pr = log_pr.float()
+                    loss   = criterion(
+                        log_probs=log_pr.view(-1, log_pr.size(-1)),
+                        targets=labels.view(-1),
+                        triplets=trip[0] if trip else [],
+                        hidden_states=H_text,
+                        head_weight=model.head.weight,
+                        incidence_matrix=inc,
+                    )
+                    loss = loss / ACCUMULATION_STEPS
+            except torch.OutOfMemoryError:
+                print(f"  ⚠ OOM at batch {bi}, skipping")
+                torch.cuda.empty_cache()
+                optimizer.zero_grad()
+                continue
 
             val = loss.item() * ACCUMULATION_STEPS
             if math.isnan(val) or math.isinf(val):
@@ -1041,22 +1047,27 @@ def train():
                 trip  = batch["triplets"]
                 enames = batch.get("entity_names")
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    log_pr, H_text, labels, _, H_hyp = model(
-                        inp, amsk, sbnds, gattn,
-                        inc, etid, enid, emk,
-                        target_ids=tgt, entity_names=enames,
-                        emotion_matrix=emot,
-                    )
-                    log_pr = log_pr.float()
-                    eloss  = criterion(
-                        log_probs=log_pr.view(-1, log_pr.size(-1)),
-                        targets=labels.view(-1),
-                        triplets=trip[0] if trip else [],
-                        hidden_states=H_text,
-                        head_weight=model.head.weight,
-                        incidence_matrix=inc,
-                    )
+                try:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        log_pr, H_text, labels, _, H_hyp = model(
+                            inp, amsk, sbnds, gattn,
+                            inc, etid, enid, emk,
+                            target_ids=tgt, entity_names=enames,
+                            emotion_matrix=emot,
+                        )
+                        log_pr = log_pr.float()
+                        eloss  = criterion(
+                            log_probs=log_pr.view(-1, log_pr.size(-1)),
+                            targets=labels.view(-1),
+                            triplets=trip[0] if trip else [],
+                            hidden_states=H_text,
+                            head_weight=model.head.weight,
+                            incidence_matrix=inc,
+                        )
+                except torch.OutOfMemoryError:
+                    print(f"  ⚠ OOM at eval batch {bi}, skipping")
+                    torch.cuda.empty_cache()
+                    continue
 
                 val = eloss.item()
                 if math.isnan(val) or math.isinf(val):

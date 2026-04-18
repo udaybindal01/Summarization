@@ -753,6 +753,10 @@ class LEDMambaHypergraphSummariser(nn.Module):
         # ── Tower 1: LED encoder + decoder ─────────────────────────────
         print(f"Loading LED backbone: {LED_MODEL}...")
         led = LEDForConditionalGeneration.from_pretrained(LED_MODEL)
+        # Enable gradient checkpointing before extracting sub-modules.
+        # Recomputes activations during backward instead of storing all 16
+        # decoder layers — saves ~4-6GB at the cost of ~20% slower backward.
+        led.gradient_checkpointing_enable()
         self.led_encoder = led.led.encoder
         self.led_decoder = led.led.decoder
         self.head        = led.lm_head
