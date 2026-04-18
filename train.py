@@ -119,7 +119,7 @@ LR_DECODER         = 2e-5  # lower LR for pretrained LED decoder
 LR_LORA            = 1e-5
 MAX_INPUT_TOKENS   = 16384  # LED max input
 MAX_TARGET_TOKENS  = 256   # summaries avg ~120 words; 512 wasted decoder memory
-MAX_SCENES         = 64
+MAX_SCENES         = 96    # was 64; GPU has ~32GB free so use it
 
 
 # =============================================================================

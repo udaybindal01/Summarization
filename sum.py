@@ -50,7 +50,7 @@ ENTITY_TYPE_MAP     = {"PERSON": 0, "ORG": 1, "GPE": 2, "FACILITY": 3, "OTHER": 
 NUM_ENTITY_TYPES    = 5
 HYPEREDGE_TYPE_MAP  = {"CONFLICT": 0, "ALLIANCE": 1, "DECEPTION": 2, "DIALOGUE": 3, "NEUTRAL": 4}
 NUM_HYPEREDGE_TYPES = 5
-MAX_ENTITIES = 100
+MAX_ENTITIES = 150
 
 
 # =============================================================================
@@ -654,11 +654,15 @@ class GraphToTextFusion(nn.Module):
         nn.init.constant_(self.gate_proj.bias, -6.0)
         self.norm_in   = nn.LayerNorm(d_model)
         self.norm_out  = nn.LayerNorm(d_model)
-        # Small FFN to integrate after fusion
+        # Small FFN to integrate after fusion.
+        # Zero-init the output linear so the residual starts as identity —
+        # prevents random FF noise from corrupting H_text at init.
         self.ff = nn.Sequential(
             nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(d_model * 2, d_model), nn.Dropout(dropout),
         )
+        nn.init.zeros_(self.ff[3].weight)
+        nn.init.zeros_(self.ff[3].bias)
 
     def forward(self, H_text, H_hyperedges):
         """
@@ -707,10 +711,14 @@ class EntitySceneCrossAttention(nn.Module):
             nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(d_model * 2, d_model), nn.Dropout(dropout),
         )
+        nn.init.zeros_(self.ff_scene[3].weight)
+        nn.init.zeros_(self.ff_scene[3].bias)
         self.ff_node = nn.Sequential(
             nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(d_model * 2, d_model), nn.Dropout(dropout),
         )
+        nn.init.zeros_(self.ff_node[3].weight)
+        nn.init.zeros_(self.ff_node[3].bias)
         # LayerScale: scene residual from entity cross-attention starts at 0.
         # Entity states are random-init — without this, random H_nodes corrupt
         # the LED scene representations and inflate loss at the start of training.
@@ -801,6 +809,9 @@ class LEDMambaHypergraphSummariser(nn.Module):
         # Stage 1: cross-attention pull of graph knowledge into LED space
         self.graph_text_fusion = GraphToTextFusion(d_model)
         # Stage 2: bidirectional scene↔entity cross-attention
+        # entity_mem_scale: gates entity nodes in aligned_memory sent to decoder.
+        # Init=0 so random entity states don't corrupt decoder at step 0.
+        self.entity_mem_scale = nn.Parameter(torch.zeros(1))
         self.entity_scene_attn = EntitySceneCrossAttention(d_model)
         self.memory_norm  = nn.LayerNorm(d_model)
         self.use_checkpointing = True
@@ -938,7 +949,9 @@ class LEDMambaHypergraphSummariser(nn.Module):
         # Log gate magnitude for W&B
         self._last_gate_mean = 0.0  # gate is internal to GraphToTextFusion
 
-        valid_nodes    = entity_mask.unsqueeze(-1).float() * H_nodes
+        # entity_mem_scale starts at 0: entity nodes contribute nothing to the
+        # decoder's memory at init (they're random). Scale grows as training progresses.
+        valid_nodes    = entity_mask.unsqueeze(-1).float() * H_nodes * torch.tanh(self.entity_mem_scale)
         aligned_memory = torch.cat([fused_scenes, valid_nodes], dim=1)
         aligned_memory = self.memory_norm(aligned_memory)
         aligned_memory = aligned_memory.clamp(-50.0, 50.0)
