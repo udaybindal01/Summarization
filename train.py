@@ -1101,12 +1101,25 @@ def train():
 
                 # Generation every 10th batch
                 if bi % 10 == 0:
+                    # Free eval loss tensors before re-running encoder for generation
+                    # — both passes would otherwise overlap in memory and OOM.
+                    try:
+                        del log_pr, H_text, labels, H_hyp
+                    except NameError:
+                        pass
+                    torch.cuda.empty_cache()
+
                     S_count = sbnds.size(1)
-                    aligned_mem, _, __, dt_vals = model(
-                        inp, amsk, sbnds, gattn,
-                        inc, etid, enid, emk,
-                        entity_names=enames, emotion_matrix=emot, return_dt=True,
-                    )
+                    try:
+                        aligned_mem, _, __, dt_vals = model(
+                            inp, amsk, sbnds, gattn,
+                            inc, etid, enid, emk,
+                            entity_names=enames, emotion_matrix=emot, return_dt=True,
+                        )
+                    except torch.OutOfMemoryError:
+                        print(f"  ⚠ OOM during eval generation at batch {bi}, skipping")
+                        torch.cuda.empty_cache()
+                        continue
 
                     mem_pad = torch.zeros(aligned_mem.size(0), aligned_mem.size(1),
                                           dtype=torch.bool, device=device)

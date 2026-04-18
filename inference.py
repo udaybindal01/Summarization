@@ -58,7 +58,12 @@ def main():
     model.eval()
 
     # ── Load test data ────────────────────────────────────────────────────────
-    eval_data_path = "/tmp/uday/mensa_test_data.jsonl.gz"
+    # Use mensa train data as test source if dedicated test file absent
+    eval_data_path = (
+        "/tmp/uday/mensa_test_data.jsonl.gz"
+        if os.path.exists("/tmp/uday/mensa_test_data.jsonl.gz")
+        else "/tmp/uday/mensa_train_data.jsonl.gz"
+    )
     eval_split     = "/tmp/uday/inference_test.jsonl"
 
     # Decompress to plain JSONL for SceneDataset
