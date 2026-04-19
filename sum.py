@@ -83,7 +83,8 @@ class EntityMambaLayer(nn.Module):
     emotionally intense scenes produce larger state changes. emotion_scale
     is initialized to 0 so it doesn't affect early training.
     """
-    def __init__(self, d_model, d_state=32, d_conv=4):
+    def __init__(self, d_model, d_state=32, d_conv=4,
+                 dt_min=0.001, dt_max=0.5):
         super().__init__()
         self.norm    = nn.LayerNorm(d_model)
         self.d_model = d_model
@@ -97,6 +98,18 @@ class EntityMambaLayer(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         # Emotion bias scale — init at 0 so emotion has no effect at start
         self.emotion_scale = nn.Parameter(torch.zeros(1))
+
+        # Mamba-style dt init: log-uniform in [dt_min, dt_max] so channels span
+        # from nearly-frozen (dt≈0.001) to fast-updating (dt≈0.5).
+        # This gives the dt heatmap meaningful dynamic range from the start.
+        with torch.no_grad():
+            dt_vals = torch.exp(
+                torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min))
+                + math.log(dt_min)
+            )
+            # inverse softplus: softplus⁻¹(y) = log(exp(y) - 1)
+            inv_dt = torch.log(torch.expm1(dt_vals).clamp(min=1e-6))
+            self.dt_proj.bias.copy_(inv_dt)
 
     def forward(self, x, emotion_bias=None, return_dt=False):
         """

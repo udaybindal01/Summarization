@@ -777,6 +777,27 @@ def train():
         compatible = {k: v for k, v in ckpt_params.items() if k not in mismatched}
         model.load_state_dict(compatible, strict=False)
 
+    # ── 5b-ii. Nudge gating parameters if they're still at their init values ──
+    # gate_proj.bias=-6 → sigmoid=0.0025, meaning hypergraph gradient is ~0.25%
+    # of what it should be. Nudge to -2 → sigmoid=0.12 (47x more gradient).
+    # entity_mem_scale=0 → tanh=0, entities contribute nothing to aligned_memory.
+    # Nudge to 0.5 → tanh=0.46 so entities have 46% weight from the start.
+    # Only nudge if the checkpoint left them stuck at near-init values.
+    with torch.no_grad():
+        gb = model.graph_text_fusion.gate_proj.bias.data
+        if gb.max().item() < -3.5:
+            print(f"  Gate bias stuck at {gb.mean():.2f} → nudging to -2.0 "
+                  f"(opens gradient flow to hypergraph tower)")
+            gb.fill_(-2.0)
+            # Clear optimizer state for this param so Adam restarts momentum
+            opt_param_id = id(model.graph_text_fusion.gate_proj.bias)
+
+        ems = model.entity_mem_scale.data
+        if ems.abs().item() < 0.1:
+            print(f"  entity_mem_scale stuck at {ems.item():.3f} → nudging to 0.5 "
+                  f"(tanh(0.5)=0.46 entity weight in aligned_memory)")
+            ems.fill_(0.5)
+
     # ── 5c. Stage setup ──────────────────────────────────────────────────────
     lora_applied = False
 
