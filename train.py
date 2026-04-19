@@ -602,15 +602,20 @@ def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
     B = aligned_memory.size(0)
     assert B == 1
 
-    beams     = [(0.0, [tokenizer.bos_token_id or 0])]
-    completed = []
-    eos_id    = tokenizer.eos_token_id or 2
-    pad_id    = tokenizer.pad_token_id or 1
+    # LED/BART decoder_start_token_id = 2 (eos used as BOS — BART convention).
+    # Training uses dec_start=2 (see model forward), so inference must match.
+    dec_start_id = 2
+    eos_id       = tokenizer.eos_token_id or 2
+    pad_id       = tokenizer.pad_token_id or 1
+    min_length   = 30   # prevent trivially short completions
 
-    for _ in range(max_new_tokens):
+    beams     = [(0.0, [dec_start_id])]
+    completed = []
+
+    for step in range(max_new_tokens):
         new_beams = []
         for score, tokens in beams:
-            if tokens[-1] == eos_id:
+            if tokens[-1] == eos_id and len(tokens) > min_length:
                 completed.append((score, tokens))
                 continue
             t_ids  = torch.tensor([tokens], dtype=torch.long, device=device)
@@ -624,6 +629,10 @@ def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
             last_hidden = dec_out.last_hidden_state
             logits      = model.head(last_hidden[:, -1, :]).float()
             log_probs   = F.log_softmax(logits, dim=-1).squeeze(0)
+
+            # Block EOS before min_length
+            if len(tokens) < min_length:
+                log_probs[eos_id] = -1e4
 
             # No-repeat trigram penalty
             if len(tokens) >= 3:
@@ -640,7 +649,8 @@ def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
             break
 
     pool = completed if completed else beams
-    best = max(pool, key=lambda x: x[0] / max(len(x[1]), 1))
+    # Length-normalised score (alpha=0.6, standard beam search convention)
+    best = max(pool, key=lambda x: x[0] / (max(len(x[1]), 1) ** 0.6))
     return tokenizer.decode(best[1], skip_special_tokens=True)
 
 
