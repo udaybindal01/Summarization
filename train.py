@@ -1239,7 +1239,7 @@ def train():
                 del g_inp, g_amsk, g_gattn, g_sbnds, g_inc, g_etid, g_enid, g_emk, g_emot
                 torch.cuda.empty_cache()
 
-        _gc.collect()
+        gc.collect()
 
         # ── Metrics ───────────────────────────────────────────────────────────
         r1 = r2 = rL = met = ent_f1 = 0.0
