@@ -666,11 +666,12 @@ class GraphToTextFusion(nn.Module):
         self.graph_info_norm = nn.LayerNorm(d_model)
         # Per-dimension gate conditioned on H_text:
         #   "what does this text representation need from the graph?"
-        # CRITICAL: bias init to -6 so gate ≈ 0.0025 at step 0.
-        # The gate opens organically as the hypergraph learns to produce
-        # useful signal — prevents corrupting LED space with early-training noise.
+        # bias init to -4: gate ≈ 0.018 at step 0 (sigmoid(-4)).
+        # Safe enough that noisy early-training graph info barely affects H_text
+        # (1.8% residual), but 7× more gradient than -6 so the gate can actually
+        # learn to open over 23 epochs.
         self.gate_proj = nn.Linear(d_model, d_model)
-        nn.init.constant_(self.gate_proj.bias, -6.0)
+        nn.init.constant_(self.gate_proj.bias, -4.0)
         self.norm_in   = nn.LayerNorm(d_model)
         self.norm_out  = nn.LayerNorm(d_model)
         # Small FFN to integrate after fusion.
