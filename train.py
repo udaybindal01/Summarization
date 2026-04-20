@@ -595,19 +595,23 @@ def split_dataset_by_movie(input_path, train_path, eval_path, num_train=1500):
 
 @torch.no_grad()
 def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
-                     device, max_new_tokens=200, beam_size=4):
+                     device, max_new_tokens=200, beam_size=4,
+                     temperature=0.85, top_k=50, repetition_penalty=1.3):
     """
     Beam search over the LED decoder using pre-computed aligned_memory.
+
+    temperature      < 1.0 sharpens the distribution (0.85 = mild sharpening)
+    top_k            keep only the top-k tokens before scoring (removes long tail)
+    repetition_penalty > 1.0 divides logit of already-generated tokens
     """
     B = aligned_memory.size(0)
     assert B == 1
 
     # LED/BART decoder_start_token_id = 2 (eos used as BOS — BART convention).
-    # Training uses dec_start=2 (see model forward), so inference must match.
     dec_start_id = 2
     eos_id       = tokenizer.eos_token_id or 2
     pad_id       = tokenizer.pad_token_id or 1
-    min_length   = 30   # prevent trivially short completions
+    min_length   = 40
 
     beams     = [(0.0, [dec_start_id])]
     completed = []
@@ -626,20 +630,35 @@ def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
                 encoder_hidden_states=aligned_memory,
                 encoder_attention_mask=enc_attn_mask,
             )
-            last_hidden = dec_out.last_hidden_state
-            logits      = model.head(last_hidden[:, -1, :]).float()
-            log_probs   = F.log_softmax(logits, dim=-1).squeeze(0)
+            logits = model.head(dec_out.last_hidden_state[:, -1, :]).float().squeeze(0)
+
+            # Repetition penalty: divide logit of tokens already generated
+            if repetition_penalty != 1.0:
+                for tok in set(tokens):
+                    if logits[tok] > 0:
+                        logits[tok] /= repetition_penalty
+                    else:
+                        logits[tok] *= repetition_penalty
 
             # Block EOS before min_length
             if len(tokens) < min_length:
-                log_probs[eos_id] = -1e4
+                logits[eos_id] = -1e9
+
+            # Temperature scaling — sharpens distribution, reduces function-word bias
+            logits = logits / temperature
+
+            # Top-k filtering — zero out everything outside top-k
+            if top_k > 0:
+                thresh = logits.topk(min(top_k, logits.size(-1))).values[-1]
+                logits[logits < thresh] = -1e9
 
             # No-repeat trigram penalty
             if len(tokens) >= 3:
                 for k in range(len(tokens) - 2):
                     ng = tuple(tokens[k:k + 3])
-                    log_probs[ng[-1]] = -1e4
+                    logits[ng[-1]] = -1e9
 
+            log_probs = F.log_softmax(logits, dim=-1)
             top_v, top_i = log_probs.topk(beam_size)
             for v, idx_val in zip(top_v.tolist(), top_i.tolist()):
                 new_beams.append((score + v, tokens + [idx_val]))
@@ -649,7 +668,6 @@ def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
             break
 
     pool = completed if completed else beams
-    # Length-normalised score (alpha=0.6, standard beam search convention)
     best = max(pool, key=lambda x: x[0] / (max(len(x[1]), 1) ** 0.6))
     return tokenizer.decode(best[1], skip_special_tokens=True)
 
@@ -941,14 +959,12 @@ def train():
 
     for epoch in range(start_epoch, EPOCHS):
 
-        # Curriculum: anneal entity penalty and contrastive weight
-        if epoch >= EPOCHS_STAGE1:
-            s2 = epoch - EPOCHS_STAGE1
-            criterion.alpha          = 0.2 + 0.3 * (s2 / max(1, EPOCHS_STAGE2 - 1))
-            criterion.entity_penalty = 3.0 + 4.0 * (s2 / max(1, EPOCHS_STAGE2 - 1))
-        else:
-            criterion.alpha          = 0.1
-            criterion.entity_penalty = 3.0
+        # entity_penalty: was annealing 3→7 in Stage 2, but this inflated the
+        # loss so heavily on entity tokens that the model couldn't converge on
+        # content-word generation at all.  Cap at 1.5 — just enough to slightly
+        # upweight entity tokens without dominating the gradient signal.
+        # alpha/coherence are disabled (set to 0.0 in criterion init).
+        criterion.entity_penalty = 1.5
 
         print(f"\n[Epoch {epoch+1}/{EPOCHS}]  "
               f"α={criterion.alpha:.3f}  entity_pen={criterion.entity_penalty:.2f}")
