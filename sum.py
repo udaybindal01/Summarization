@@ -404,7 +404,11 @@ class DynamicHypergraphTower(nn.Module):
 
             # ── Stream Fusion (4 streams) ────────────────────────────────
             if self.use_adaptive_streams:
-                stream_attn = F.softmax(self.stream_gate(e_s), dim=-1)
+                # Floor at 0.05 per stream so no stream collapses to zero
+                # and loses gradient entirely (arc stream was collapsing).
+                raw_attn    = F.softmax(self.stream_gate(e_s), dim=-1)
+                stream_attn = 0.05 + 0.80 * raw_attn   # range [0.05, 0.85]
+                stream_attn = stream_attn / stream_attn.sum(dim=-1, keepdim=True)
                 msg = (stream_attn[:, 0].view(B, 1, 1) * msg_scene +
                        stream_attn[:, 1].view(B, 1, 1) * msg_arc +
                        stream_attn[:, 2].view(B, 1, 1) * msg_interact +

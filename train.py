@@ -859,12 +859,16 @@ def train():
     print(f"  Trainable groups: {sorted(set(n.split('.')[0] for n, _ in trainable_named))}")
 
     # ── 6. Loss ───────────────────────────────────────────────────────────────
+    # cont_loss was at ~0.41 (coin-flip on binary task) — pure noise.
+    # coh_loss was 2–10, very noisy, destabilising gradients.
+    # Both disabled until LM loss reaches a stable plateau (~epoch 12+),
+    # at which point they can be re-enabled via --no_contrastive_loss=False.
     criterion = RelationalEventConsistencyLoss(
-        alpha=0.1 if not ABLATION["no_contrastive_loss"] else 0.0,
+        alpha=0.0,   # contrastive off — re-enable when R2 > 0.05
         tokenizer=tokenizer,
         entity_penalty=ABLATION["entity_penalty"],
         label_smoothing=0.1,
-        coherence_weight=0.05 if not ABLATION["no_coherence_loss"] else 0.0,
+        coherence_weight=0.0,  # coherence off — too noisy at current scale
     )
 
     # ── 7. Optimiser ──────────────────────────────────────────────────────────
