@@ -431,7 +431,12 @@ class DynamicHypergraphTower(nn.Module):
 
         # ── Phase 2: Per-entity Mamba trajectories ──────────────────────
         entity_msgs = torch.stack(msg_per_scene, dim=2)  # [B, N, S, D]
-        entity_msgs = entity_msgs + h_entities_init.unsqueeze(2)
+        # Add init embedding only at scenes where entity is actually present.
+        # Broadcasting h_entities_init to all scenes injects non-zero "signal"
+        # at absent-entity scenes, teaching Mamba a false "entity is everywhere"
+        # pattern. Mask to presence only so Mamba sees zero for absent scenes.
+        presence_mask = (inc > 0).float().unsqueeze(-1)   # [B, N, S, 1]
+        entity_msgs = entity_msgs + h_entities_init.unsqueeze(2) * presence_mask
         entity_trajs = entity_msgs.view(B * N, S, D)
 
         # Emotion bias: [B, N, S] → [B*N, S, 1]

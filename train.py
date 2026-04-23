@@ -652,10 +652,14 @@ def generate_summary(model, aligned_memory, enc_attn_mask, tokenizer,
                 thresh = logits.topk(min(top_k, logits.size(-1))).values[-1]
                 logits[logits < thresh] = -1e9
 
-            # No-repeat trigram penalty
-            if len(tokens) >= 3:
-                for k in range(len(tokens) - 2):
-                    ng = tuple(tokens[k:k + 3])
+            # No-repeat 4-gram (not trigram): trigram blocking is too aggressive
+            # for movie summaries where entity names naturally recur (e.g. "John
+            # says" or "the shark" appearing multiple times is correct and useful).
+            # 4-gram blocking prevents obvious copy-loops while allowing natural
+            # repetition of character names and short plot phrases.
+            if len(tokens) >= 4:
+                for k in range(len(tokens) - 3):
+                    ng = tuple(tokens[k:k + 4])
                     logits[ng[-1]] = -1e9
 
             log_probs = F.log_softmax(logits, dim=-1)
@@ -867,6 +871,9 @@ def train():
     else:
         _set_stage1_grads()
 
+    # Track whether we need to create Stage 2 scheduler immediately (resumed run)
+    _stage2_resumed = start_epoch >= EPOCHS_STAGE1
+
     # Diagnostic
     trainable_named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     frozen_named    = [(n, p) for n, p in model.named_parameters() if not p.requires_grad]
@@ -885,7 +892,7 @@ def train():
         alpha=0.0,   # contrastive off — re-enable when R2 > 0.05
         tokenizer=tokenizer,
         entity_penalty=ABLATION["entity_penalty"],
-        label_smoothing=0.1,
+        label_smoothing=0.05,  # reduced from 0.1 — inflated loss floor by ~1.1 nats
         coherence_weight=0.0,  # coherence off — too noisy at current scale
     )
 
@@ -913,12 +920,24 @@ def train():
     optimizer = _make_optim()
     wandb.watch(model, criterion, log="all", log_freq=50)
 
-    total_steps  = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
-    warmup_steps = int(0.05 * total_steps)
-    scheduler    = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
-    )
+    if _stage2_resumed:
+        # Resumed into Stage 2 — create Stage 2 schedule immediately so LR
+        # is calibrated for remaining EPOCHS_STAGE2 epochs, not EPOCHS total.
+        _s2_remaining = EPOCHS - start_epoch
+        _s2_total     = (len(train_dl) // ACCUMULATION_STEPS) * _s2_remaining
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=int(0.05 * _s2_total),
+            num_training_steps=_s2_total,
+        )
+        print(f"  Stage 2 scheduler created for {_s2_remaining} remaining epochs "
+              f"({_s2_total} optimizer steps)")
+    else:
+        total_steps  = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS_STAGE1
+        warmup_steps = int(0.05 * total_steps)
+        scheduler    = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
 
     # Restore optimizer + scheduler state so Adam moments carry over between runs
     if ckpt_state and "optimizer_state_dict" in ckpt_state:
