@@ -187,7 +187,17 @@ class MovieHypergraphDataset(Dataset):
         "him", "her", "he", "she", "they", "them", "it", "i",
         "we", "you", "who", "what", "that", "this", "me", "my",
         "his", "its", "our", "your", "their", "the", "an",
+        # Screenplay direction headers that NER mis-tags as entities
+        "int", "ext", "int.", "ext.", "continued", "cont'd",
+        # Single-char tokens and digits
     })
+    # Regex to detect non-name strings: revision watermarks, numbers, all-digits
+    import re as _re
+    _GARBAGE_PAT = _re.compile(
+        r'^\d|'           # starts with digit (e.g. "08.09 orange revisions")
+        r'\d{2,}|'        # contains 2+ consecutive digits
+        r'^(int|ext)\.?$' # screenplay direction markers
+    )
     _MAX_SCENE_FRAC = 0.50
     _MIN_SCENES     = 1
 
@@ -222,15 +232,19 @@ class MovieHypergraphDataset(Dataset):
             """Resolve a mention to its canonical name via coreference."""
             return coref.get(name, name)
 
+        def _valid_name(n):
+            return (n and len(n) > 1 and n not in self._STOP
+                    and not self._GARBAGE_PAT.search(n))
+
         ents = {}
         for e in scene.get("ner_entities", []):
             n = e.get("text", "").strip().lower()
             t = e.get("type", "OTHER")
-            if n and len(n) > 1 and n not in self._STOP:
+            if _valid_name(n):
                 ents[_canon(n)] = t
         for char in scene.get("characters", []):
             n = char.strip().lower()
-            if n and len(n) > 1 and n not in self._STOP:
+            if _valid_name(n):
                 ents.setdefault(_canon(n), "PERSON")
         for trip in scene.get("graph_triplets", []):
             parts = trip.split("_")
