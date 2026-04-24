@@ -483,6 +483,7 @@ class MovieHypergraphDataset(Dataset):
             "global_attention_mask": global_attention_mask,   # [T]
             "scene_boundaries":      scene_boundaries,       # [S, 2]
             "target_ids":            target_ids,             # [T_tgt]
+            "summary_text":          summary_str,            # raw gold summary (untruncated)
             "incidence_matrix":      incidence,              # [N, S]
             "edge_type_ids":         edge_type_ids,          # [S]
             "entity_type_ids":       entity_type_ids,        # [N]
@@ -525,6 +526,7 @@ def hypergraph_collate_fn(batch):
     all_names     = []
     all_movie     = []
     num_scenes_b  = []
+    all_summary   = []
 
     for b, item in enumerate(batch):
         T   = item["input_ids"].size(0)
@@ -547,6 +549,7 @@ def hypergraph_collate_fn(batch):
         all_names.append(item["entity_names"])
         all_movie.append(item["movie_name"])
         num_scenes_b.append(ns)
+        all_summary.append(item.get("summary_text", ""))
 
     return {
         "input_ids":             input_ids,
@@ -563,6 +566,7 @@ def hypergraph_collate_fn(batch):
         "entity_names":          all_names,
         "movie_name":            all_movie,
         "num_scenes":            num_scenes_b,
+        "summary_text":          all_summary,   # raw untruncated gold summaries
     }
 
 
@@ -919,13 +923,20 @@ def train():
                      if p.requires_grad
                      and ("led_decoder" in n or n.startswith("head."))
                      and "lora_" not in n]
-        _dec_ids = {id(p) for p in decoder_p}
+        # LED encoder global attention: pretrained weights — use decoder LR,
+        # not new-layers LR (1e-4 is too high for already-pretrained layers).
+        global_attn_p = [p for n, p in model.named_parameters()
+                         if p.requires_grad and "led_encoder" in n
+                         and "global" in n.lower() and "lora_" not in n]
+        _dec_ids  = {id(p) for p in decoder_p}
+        _gattn_ids = {id(p) for p in global_attn_p}
         other_p = [p for n, p in model.named_parameters()
                    if p.requires_grad and "lora_" not in n
-                   and id(p) not in _dec_ids]
+                   and id(p) not in _dec_ids and id(p) not in _gattn_ids]
         groups = [
-            {"params": other_p,    "lr": LR_NEW_LAYERS},
-            {"params": decoder_p,  "lr": LR_DECODER},
+            {"params": other_p,       "lr": LR_NEW_LAYERS},
+            {"params": decoder_p,     "lr": LR_DECODER},
+            {"params": global_attn_p, "lr": LR_DECODER},  # pretrained, same as decoder
         ]
         if lora_p:
             groups.append({"params": lora_p, "lr": LR_LORA})
@@ -1131,7 +1142,7 @@ def train():
 
         # Buffer for post-loop generation: collect (cpu tensors, ref text) for
         # up to GEN_SAMPLES movies so generation happens after full cache flush.
-        GEN_SAMPLES  = 5
+        GEN_SAMPLES  = 50   # was 5 — too few for stable ROUGE estimates
         gen_buffer   = []   # list of dicts with CPU tensors
         hg_viz_batch = None # first eval batch for hypergraph visualisation
 
@@ -1216,6 +1227,13 @@ def train():
 
                 # Collect CPU-pinned tensors for post-loop generation (no GPU overlap)
                 if len(gen_buffer) < GEN_SAMPLES:
+                    # Use raw summary_text (untruncated) as ROUGE reference.
+                    # tgt was tokenized with max_length=256, so decoding it gives
+                    # a truncated reference that inflates ROUGE recall.
+                    raw_ref = (batch["summary_text"][0]
+                               if batch.get("summary_text") else
+                               tokenizer.decode(tgt[0].cpu().tolist(),
+                                                skip_special_tokens=True))
                     gen_buffer.append({
                         "inp":    inp.cpu(),
                         "amsk":   amsk.cpu(),
@@ -1226,8 +1244,7 @@ def train():
                         "enid":   enid.cpu(),
                         "emk":    emk.cpu(),
                         "emot":   emot.cpu(),
-                        "ref":    tokenizer.decode(tgt[0].cpu().tolist(),
-                                                   skip_special_tokens=True),
+                        "ref":    raw_ref,
                         "enames": enames,
                     })
 
