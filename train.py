@@ -923,20 +923,28 @@ def train():
                      if p.requires_grad
                      and ("led_decoder" in n or n.startswith("head."))
                      and "lora_" not in n]
-        # LED encoder global attention: pretrained weights — use decoder LR,
-        # not new-layers LR (1e-4 is too high for already-pretrained layers).
+        # LED encoder global attention: pretrained weights → decoder LR
         global_attn_p = [p for n, p in model.named_parameters()
                          if p.requires_grad and "led_encoder" in n
                          and "global" in n.lower() and "lora_" not in n]
-        _dec_ids  = {id(p) for p in decoder_p}
+        # scene_pool_proj is identity-initialized to preserve LED encoder space.
+        # LR_NEW_LAYERS=1e-4 caused gradient=10k→step=1.0 which destroyed the
+        # identity init in a single step. Use decoder LR like other pretrained layers.
+        scene_pool_p = [p for n, p in model.named_parameters()
+                        if p.requires_grad and "scene_pool" in n]
+        _dec_ids   = {id(p) for p in decoder_p}
         _gattn_ids = {id(p) for p in global_attn_p}
+        _sp_ids    = {id(p) for p in scene_pool_p}
         other_p = [p for n, p in model.named_parameters()
                    if p.requires_grad and "lora_" not in n
-                   and id(p) not in _dec_ids and id(p) not in _gattn_ids]
+                   and id(p) not in _dec_ids
+                   and id(p) not in _gattn_ids
+                   and id(p) not in _sp_ids]
         groups = [
             {"params": other_p,       "lr": LR_NEW_LAYERS},
             {"params": decoder_p,     "lr": LR_DECODER},
-            {"params": global_attn_p, "lr": LR_DECODER},  # pretrained, same as decoder
+            {"params": global_attn_p, "lr": LR_DECODER},
+            {"params": scene_pool_p,  "lr": LR_DECODER},  # identity-init, treat like pretrained
         ]
         if lora_p:
             groups.append({"params": lora_p, "lr": LR_LORA})
