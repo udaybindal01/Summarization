@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Envs
+venv/
+.venv/
+env/
+
+# Data / checkpoints (live under /tmp/uday on the training server)
+*.jsonl
+*.jsonl.gz
+*.pt
+*.ckpt
+checkpoints/
+wandb/
+
+# OS
+.DS_Store
