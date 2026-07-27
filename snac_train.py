@@ -65,7 +65,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backbone", default="facebook/bart-large-cnn")
     ap.add_argument("--dataset", default="moviesum")
-    ap.add_argument("--out", default="/scratch/karan/snac")
+    ap.add_argument("--out", default="/Summarization/summary")
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--grad_accum", type=int, default=8)
     ap.add_argument("--lr_state", type=float, default=1e-4)
@@ -81,6 +81,8 @@ def main():
     ap.add_argument("--gen_tokens", type=int, default=400)
     ap.add_argument("--max_eval", type=int, default=100)
     ap.add_argument("--limit_train", type=int, default=0, help="0 = full train set")
+    ap.add_argument("--log_every", type=int, default=25)
+    ap.add_argument("--warmup_frac", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -111,6 +113,17 @@ def main():
         {"params": bb_params, "lr": args.lr_dec},
     ], weight_decay=0.01)
 
+    total_updates = args.epochs * max(1, len(train) // args.grad_accum)
+    sched = None
+    try:
+        from transformers import get_cosine_schedule_with_warmup
+        sched = get_cosine_schedule_with_warmup(
+            opt, int(args.warmup_frac * total_updates), total_updates)
+        print(f"[sched] cosine warmup: {total_updates} updates, "
+              f"{int(args.warmup_frac*total_updates)} warmup")
+    except Exception as e:
+        print(f"[sched] scheduler unavailable ({e}); constant LR")
+
     rouge, bertscore = get_metrics()
     use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
     best = -1.0
@@ -118,7 +131,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train(); random.shuffle(train)
         opt.zero_grad()
-        running = 0.0; t0 = time.time()
+        running = 0.0; seen = 0; t0 = time.time()
         for i, raw in enumerate(train, 1):
             batch = move_batch(tokenize_movie(raw, tok, cfg), device)
             ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_bf16 \
@@ -127,17 +140,20 @@ def main():
                 out = model(batch)
             loss = out["loss"] / args.grad_accum
             loss.backward()
-            running += out["loss"].item()
+            running += out["nll"].item(); seen += 1
             if i % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(
                     [p for g in opt.param_groups for p in g["params"]], 1.0)
                 opt.step(); opt.zero_grad()
-            if i % 100 == 0:
+                if sched is not None:
+                    sched.step()
+            if i % args.log_every == 0 or i == 1:
+                lr = opt.param_groups[1]["lr"]
                 print(f"  e{epoch} {i}/{len(train)} "
-                      f"loss={running/100:.3f} nll={out['nll'].item():.3f} "
-                      f"probe={out['probe'].item():.3f} dΔ={out['delta_mean'].item():.3f} "
-                      f"({(time.time()-t0)/60:.1f}m)")
-                running = 0.0
+                      f"nll={running/max(1,seen):.3f} probe={out['probe'].item():.3f} "
+                      f"dΔ={out['delta_mean'].item():.3f} lr={lr:.2e} "
+                      f"({(time.time()-t0)/60:.1f}m)", flush=True)
+                running = 0.0; seen = 0
         opt.step(); opt.zero_grad()
 
         metrics = run_eval(model, tok, val, cfg, device, rouge, bertscore,

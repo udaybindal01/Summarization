@@ -52,6 +52,15 @@ class StoryState(nn.Module):
         self.probe = nn.Sequential(nn.Linear(d_model, d_model // 2), nn.GELU(),
                                    nn.Linear(d_model // 2, 1))
 
+        # --- in-distribution init: at step 0 the state must look like real encoder
+        #     output so BART's pretrained decoder isn't thrown off (else it degenerates
+        #     to "the the the"). Entity slots start EXACTLY at the encoder-pooled name
+        #     embedding (name_proj = identity), type embeddings tiny, and the write gate
+        #     starts near-closed so early scenes barely perturb the state.
+        nn.init.eye_(self.name_proj.weight); nn.init.zeros_(self.name_proj.bias)
+        nn.init.normal_(self.slot_type.weight, std=0.02)
+        nn.init.constant_(self.gate.bias, -2.0)          # sigmoid(-2) ~ 0.12
+
         is_entity = torch.zeros(M, dtype=torch.long)
         is_entity[:cfg.max_entities] = 1
         self.register_buffer("is_entity", is_entity)
@@ -71,11 +80,13 @@ class StoryState(nn.Module):
         read, _ = self.read_attn(q, kv, kv, key_padding_mask=kpm)
         read = read.squeeze(0)                                    # [M, D]
 
-        cand = self.cand(torch.cat([S_prev, read], dim=-1))       # [M, D]
+        cand = self.norm(self.cand(torch.cat([S_prev, read], dim=-1)))   # [M, D]
         g = torch.sigmoid(self.gate(torch.cat([S_prev, read], dim=-1)))
-        # ADDRESSABLE write: entity slots gate is scaled by presence; free slots = 1
+        # ADDRESSABLE write: entity slots gate is scaled by presence; free slots = 1.
+        # Gated residual (GRU-like): with gate near 0 at init, S_new ~= S_prev, so the
+        # state stays at its in-distribution name-embedding init.
         eff = g * pres_vec.unsqueeze(-1)                          # [M, D]
-        S_new = self.norm(S_prev + eff * (cand - S_prev))
+        S_new = S_prev + eff * (cand - S_prev)                    # convex, bounded
         delta = (S_new - S_prev).norm(dim=-1)                     # [M]
 
         ent_slots = S_new[:self.cfg.max_entities]                 # [E, D]
