@@ -117,7 +117,7 @@ class StoryState(nn.Module):
 
 
 class SNaC(nn.Module):
-    def __init__(self, cfg: SNaCConfig, lora: bool = False):
+    def __init__(self, cfg: SNaCConfig, lora: bool = False, train_encoder: bool = False):
         super().__init__()
         self.cfg = cfg
         self.backbone = AutoModelForSeq2SeqLM.from_pretrained(cfg.backbone)
@@ -132,12 +132,17 @@ class SNaC(nn.Module):
                             target_modules=["q_proj", "v_proj", "k_proj", "out_proj"])
             self.backbone = get_peft_model(self.backbone, lc)
             self.encoder_frozen = False
+        elif train_encoder:
+            self.encoder_frozen = False                  # full fine-tune (most reliable)
         else:
             for p in self.encoder.parameters():          # freeze encoder body
                 p.requires_grad = False
             self.encoder_frozen = True
 
         self.state = StoryState(cfg, self.d)
+        # normalize the fused memory so state slots and token states share a scale
+        # -> prevents high-norm state slots from hijacking decoder cross-attention.
+        self.mem_norm = nn.LayerNorm(self.d)
 
     # --- helpers ------------------------------------------------------------
     def _enc_ctx(self):
@@ -169,6 +174,7 @@ class SNaC(nn.Module):
         local_msk = scene_mask[idx].reshape(-1)                    # [k*L]
 
         mem = torch.cat([final_state, local_tok], dim=0)           # [M + k*L, D]
+        mem = self.mem_norm(mem)                                    # shared scale
         msk = torch.cat([torch.ones(final_state.size(0), device=mem.device),
                          local_msk.float()], dim=0)                # [M + k*L]
         return mem.unsqueeze(0), msk.unsqueeze(0), idx             # add batch dim

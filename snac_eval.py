@@ -23,7 +23,8 @@ from snac_model import SNaC, move_batch
 def load_model(ckpt_path, device):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = SNaCConfig(**ckpt["cfg"])
-    model = SNaC(cfg, lora=ckpt.get("lora", False))
+    model = SNaC(cfg, lora=ckpt.get("lora", False),
+                 train_encoder=ckpt.get("train_encoder", False))
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
     if missing:
         print(f"[load] {len(missing)} missing keys (ok if frozen/tied), "

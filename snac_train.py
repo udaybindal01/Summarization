@@ -71,6 +71,10 @@ def main():
     ap.add_argument("--lr_state", type=float, default=1e-4)
     ap.add_argument("--lr_dec", type=float, default=2e-5)
     ap.add_argument("--lora", action="store_true")
+    ap.add_argument("--train_encoder", action="store_true",
+                    help="unfreeze the encoder (most reliable; matches the working prototype)")
+    ap.add_argument("--grad_ckpt", action="store_true",
+                    help="gradient checkpointing (saves memory when --train_encoder)")
     ap.add_argument("--max_scenes", type=int, default=48)
     ap.add_argument("--scene_tokens", type=int, default=256)
     ap.add_argument("--max_entities", type=int, default=24)
@@ -94,7 +98,10 @@ def main():
           f"slots={cfg.n_slots} (E={cfg.max_entities}+F={cfg.free_slots})")
 
     tok = AutoTokenizer.from_pretrained(cfg.backbone)
-    model = SNaC(cfg, lora=args.lora).to(device)
+    model = SNaC(cfg, lora=args.lora, train_encoder=args.train_encoder).to(device)
+    if args.grad_ckpt:
+        model.backbone.config.use_cache = False
+        model.backbone.gradient_checkpointing_enable()
 
     print("[data] loading MovieSum splits …")
     train = load_movies("train", cfg)
@@ -161,7 +168,8 @@ def main():
         score = metrics.get("rougeL", metrics.get("rouge1", 0.0))
         print(f"[epoch {epoch}] val = {json.dumps(metrics)}")
         ckpt = {"model": model.state_dict(), "cfg": cfg.__dict__,
-                "epoch": epoch, "metrics": metrics, "lora": args.lora}
+                "epoch": epoch, "metrics": metrics, "lora": args.lora,
+                "train_encoder": args.train_encoder}
         torch.save(ckpt, os.path.join(args.out, "snac_last.pt"))
         if score > best:
             best = score
