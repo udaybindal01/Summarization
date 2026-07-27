@@ -55,7 +55,7 @@ def load_movies(path, n_movies, tok, max_chars=200_000):
 
     scenes = defaultdict(list)          # key -> [(scene_idx, clean_text), ...]
     summ_src = {}                       # key -> (scene_idx, summary_text, target_ids)
-    n_lines = first_rec = 0
+    n_lines = 0
     first_keys = None
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt") as f:
@@ -71,6 +71,11 @@ def load_movies(path, n_movies, tok, max_chars=200_000):
             key = _movie_key(mid)
             sidx = _scene_idx(mid)
             txt = (r.get("clean_text") or "").strip()
+            if not txt:                       # legacy tokenized schema: no raw text
+                iid = r.get("input_ids")
+                if isinstance(iid, list) and iid:
+                    txt = tok.decode([t for t in iid if isinstance(t, int)],
+                                     skip_special_tokens=True).strip()
             if txt:
                 scenes[key].append((sidx, txt))
             # keep the earliest scene's summary source per movie
