@@ -32,31 +32,75 @@ import torch
 from transformers import AutoTokenizer, BartForConditionalGeneration
 
 
-def load_movies(path, n_movies, max_chars=200_000):
-    """Group scene-level jsonl.gz into (screenplay_text, summary_text) per movie."""
-    scenes = defaultdict(list)
-    summaries = {}
+def _movie_key(mid):
+    return mid.split("_Scene_")[0] if "_Scene_" in mid else re.sub(r"_[Ss]cene_?\d+$", "", mid)
+
+
+def _scene_idx(mid):
+    m = re.search(r"_[Ss]cene_?(\d+)", mid)
+    return int(m.group(1)) if m else 0
+
+
+def load_movies(path, n_movies, tok, max_chars=200_000):
+    """Group scene-level jsonl into (screenplay, summary) per movie.
+
+    Mirrors train.py's summary logic: prefer scene-0 `summary_text`, else decode
+    scene-0 `target_ids` with the tokenizer. Self-diagnoses on empty result.
+    """
+    import os
+    if not os.path.exists(path):
+        sys.exit(f"[error] --data path does not exist ON THIS NODE: {path}\n"
+                 f"  hint: run  find /scratch /tmp /local -name '*.jsonl*' 2>/dev/null  "
+                 f"ON the compute node (paths differ from the login node).")
+
+    scenes = defaultdict(list)          # key -> [(scene_idx, clean_text), ...]
+    summ_src = {}                       # key -> (scene_idx, summary_text, target_ids)
+    n_lines = first_rec = 0
+    first_keys = None
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt") as f:
         for line in f:
+            n_lines += 1
             try:
                 r = json.loads(line)
             except Exception:
                 continue
-            mid = r.get("movie_id", "")
-            key = re.sub(r"_[Ss]cene_?\d+$", "", mid)
+            if first_keys is None:
+                first_keys = list(r.keys())
+            mid = r.get("movie_id") or r.get("id") or ""
+            key = _movie_key(mid)
+            sidx = _scene_idx(mid)
             txt = (r.get("clean_text") or "").strip()
             if txt:
-                scenes[key].append(txt)
-            summ = (r.get("summary_text") or "").strip()
-            if summ and key not in summaries:
-                summaries[key] = summ
+                scenes[key].append((sidx, txt))
+            # keep the earliest scene's summary source per movie
+            if key not in summ_src or sidx < summ_src[key][0]:
+                summ_src[key] = (sidx, (r.get("summary_text") or "").strip(),
+                                 r.get("target_ids"))
 
-    movies = []
+    movies, via_text, via_ids = [], 0, 0
     for key, chunks in scenes.items():
-        if key in summaries and summaries[key]:
-            screenplay = ("\n</s>\n".join(chunks))[:max_chars]
-            movies.append((screenplay, summaries[key]))
+        sidx, stext, tids = summ_src.get(key, (0, "", None))
+        summary = stext
+        if summary:
+            via_text += 1
+        elif isinstance(tids, list) and tids:
+            summary = tok.decode([t for t in tids if isinstance(t, int)],
+                                 skip_special_tokens=True).strip()
+            if summary:
+                via_ids += 1
+        if not summary:
+            continue
+        chunks.sort(key=lambda x: x[0])
+        screenplay = ("\n</s>\n".join(t for _, t in chunks))[:max_chars]
+        movies.append((screenplay, summary))
+
+    print(f"[data] scanned {n_lines:,} scenes across {len(scenes):,} movies; "
+          f"built {len(movies)} pairs (summary via_text={via_text} via_target_ids={via_ids})")
+    if not movies:
+        print(f"[data][diagnose] first record keys = {first_keys}")
+        sys.exit("[error] 0 usable (screenplay, summary) pairs. The schema above "
+                 "shows what's actually in the file — tell me these keys and I'll adapt the loader.")
     random.Random(0).shuffle(movies)
     return movies[:n_movies]
 
@@ -106,10 +150,7 @@ def main():
     model = BartForConditionalGeneration.from_pretrained(args.model).to(dev)
     model.train()
 
-    movies = load_movies(args.data, args.n_movies)
-    if not movies:
-        sys.exit(f"[error] no movies loaded from {args.data}")
-    print(f"[data] {len(movies)} movies loaded")
+    movies = load_movies(args.data, args.n_movies, tok)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
