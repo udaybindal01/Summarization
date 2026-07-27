@@ -129,10 +129,45 @@ def encoder_memory(model, input_ids, attention_mask, mode, chunk=32):
     return mem, mmask
 
 
+def load_movies_hf(name, split, n_movies, max_chars=200_000):
+    """Load (screenplay, summary) pairs straight from HuggingFace.
+
+    Uses the untruncated gold `summary`, unlike the jsonl split files. Mirrors
+    the field names emnlp_extractor.py used: `script` for the screenplay text,
+    `summary` for the target.
+    """
+    from datasets import load_dataset
+    ds_name = {"moviesum": "rohitsaxena/MovieSum",
+               "mensa": "rohitsaxena/MENSA"}.get(name, name)
+    print(f"[data] load_dataset({ds_name!r}, split={split!r}) …")
+    ds = load_dataset(ds_name, split=split)
+    movies = []
+    for ex in ds:
+        script = ex.get("script") or ex.get("screenplay") or ex.get("scenes") or ""
+        if isinstance(script, list):
+            script = "\n".join(str(s) for s in script)
+        summary = (ex.get("summary") or "").strip()
+        if not (isinstance(script, str) and len(script.strip()) > 10 and summary):
+            continue
+        # keep <scene> structure as </s> separators for a fair 'full'/'pooled' test
+        script = re.sub(r"</?scene>", "\n</s>\n", script, flags=re.I)
+        movies.append((script.strip()[:max_chars], summary))
+        if len(movies) >= n_movies:
+            break
+    print(f"[data] built {len(movies)} pairs from {ds_name} (summaries are full gold text)")
+    if not movies:
+        sys.exit(f"[error] 0 pairs from {ds_name}; columns were: {ds.column_names}")
+    return movies
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["full", "pooled"], required=True)
     ap.add_argument("--data", default="/tmp/uday/moviesum_data.jsonl.gz")
+    ap.add_argument("--hf", default=None,
+                    help="load straight from HuggingFace instead of --data: "
+                         "'moviesum', 'mensa', or any hub dataset id")
+    ap.add_argument("--hf_split", default="train")
     ap.add_argument("--model", default="facebook/bart-base")
     ap.add_argument("--n_movies", type=int, default=30)
     ap.add_argument("--steps", type=int, default=400)
@@ -150,7 +185,10 @@ def main():
     model = BartForConditionalGeneration.from_pretrained(args.model).to(dev)
     model.train()
 
-    movies = load_movies(args.data, args.n_movies, tok)
+    if args.hf:
+        movies = load_movies_hf(args.hf, args.hf_split, args.n_movies)
+    else:
+        movies = load_movies(args.data, args.n_movies, tok)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
