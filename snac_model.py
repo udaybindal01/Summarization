@@ -162,13 +162,29 @@ class SNaC(nn.Module):
         return (h * m).sum(1) / m.sum(1).clamp(min=1)             # [E, D]
 
     def _build_memory(self, final_state, scene_tok, scene_mask):
-        """Two-source memory: [state slots ; retrieved verbatim scene tokens]."""
-        # local channel: pick top-k scenes most relevant to the final state
+        """Decoder cross-attention memory. Mode selects what goes in it."""
+        S = scene_tok.size(0)
+        mode = self.cfg.memory_mode
+
+        # --- diagnostic: raw scene tokens only, NO state / retrieval / norm.
+        #     Exactly the prototype's working recipe (per-scene-encoded). If this
+        #     can't overfit, the memory->decoder->loss plumbing has a bug.
+        if mode == "full":
+            mem = scene_tok.reshape(-1, self.d)                    # [S*L, D] raw
+            msk = scene_mask.reshape(-1).float()                   # [S*L]
+            return mem.unsqueeze(0), msk.unsqueeze(0), torch.arange(S, device=mem.device)
+
+        if mode == "state_only":
+            mem = self.mem_norm(final_state)
+            msk = torch.ones(final_state.size(0), device=mem.device)
+            return mem.unsqueeze(0), msk.unsqueeze(0), torch.arange(0, device=mem.device)
+
+        # --- two_source (default): [state slots ; retrieved verbatim scene tokens]
         scene_pool = (scene_tok * scene_mask.unsqueeze(-1)).sum(1) / \
                      scene_mask.sum(1, keepdim=True).clamp(min=1)   # [S, D]
         query = final_state.mean(0, keepdim=True)                  # [1, D]
         scores = (scene_pool @ query.t()).squeeze(-1)              # [S]
-        k = min(self.cfg.k_retrieve, scene_tok.size(0))
+        k = min(self.cfg.k_retrieve, S)
         idx = torch.topk(scores, k).indices
         local_tok = scene_tok[idx].reshape(-1, self.d)             # [k*L, D]
         local_msk = scene_mask[idx].reshape(-1)                    # [k*L]

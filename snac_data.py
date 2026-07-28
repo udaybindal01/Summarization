@@ -35,6 +35,7 @@ class SNaCConfig:
     n_heads: int = 8
     k_retrieve: int = 6                          # scenes kept at full token resolution (local channel)
     lambda_probe: float = 0.3                    # weight on the entity-presence probe loss
+    memory_mode: str = "two_source"              # 'two_source' | 'full' | 'state_only' (diagnostics)
     # misc
     seed: int = 0
 

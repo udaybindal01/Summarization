@@ -58,7 +58,7 @@ def build_config(args) -> SNaCConfig:
         max_scenes=args.max_scenes, scene_tokens=args.scene_tokens,
         max_entities=args.max_entities, free_slots=args.free_slots,
         max_target=args.max_target, k_retrieve=args.k_retrieve,
-        lambda_probe=args.lambda_probe, seed=args.seed)
+        lambda_probe=args.lambda_probe, memory_mode=args.memory_mode, seed=args.seed)
 
 
 def main():
@@ -81,6 +81,9 @@ def main():
     ap.add_argument("--free_slots", type=int, default=8)
     ap.add_argument("--max_target", type=int, default=400)
     ap.add_argument("--k_retrieve", type=int, default=6)
+    ap.add_argument("--memory_mode", default="two_source",
+                    choices=["two_source", "full", "state_only"],
+                    help="'full' = raw scene tokens only (plumbing diagnostic)")
     ap.add_argument("--lambda_probe", type=float, default=0.3)
     ap.add_argument("--gen_tokens", type=int, default=400)
     ap.add_argument("--max_eval", type=int, default=100)
