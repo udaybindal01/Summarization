@@ -161,8 +161,8 @@ def main():
                 lr = opt.param_groups[1]["lr"]
                 print(f"  e{epoch} {i}/{len(train)} "
                       f"nll={running/max(1,seen):.3f} probe={out['probe'].item():.3f} "
-                      f"dΔ={out['delta_mean'].item():.3f} lr={lr:.2e} "
-                      f"({(time.time()-t0)/60:.1f}m)", flush=True)
+                      f"dΔ={out['delta_mean'].item():.3f} gate={out['state_gate'].item():.3f} "
+                      f"lr={lr:.2e} ({(time.time()-t0)/60:.1f}m)", flush=True)
                 running = 0.0; seen = 0
         opt.step(); opt.zero_grad()
 

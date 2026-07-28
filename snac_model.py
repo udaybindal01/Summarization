@@ -140,9 +140,12 @@ class SNaC(nn.Module):
             self.encoder_frozen = True
 
         self.state = StoryState(cfg, self.d)
-        # normalize the fused memory so state slots and token states share a scale
-        # -> prevents high-norm state slots from hijacking decoder cross-attention.
         self.mem_norm = nn.LayerNorm(self.d)
+        # Gate the state's contribution to the decoder memory, initialized to ZERO.
+        # At init the model behaves exactly like --memory_mode full (raw tokens only,
+        # which provably learns); the state earns its way in only if it helps, so an
+        # untrained state can never disrupt the pretrained decoder.
+        self.state_gate = nn.Parameter(torch.zeros(1))
 
     # --- helpers ------------------------------------------------------------
     def _enc_ctx(self):
@@ -190,9 +193,9 @@ class SNaC(nn.Module):
         local_msk = scene_mask[idx].reshape(-1)                    # [k*L]
 
         # Keep the retrieved tokens RAW (the distribution the decoder expects, proven
-        # by --memory_mode full). Normalize ONLY the state slots so they sit at a
-        # comparable scale and can neither hijack nor be ignored.
-        state = self.mem_norm(final_state)                         # [M, D]
+        # by --memory_mode full). The state slots are normalized AND gated to ~0 at
+        # init, so training starts from the working raw-token behavior.
+        state = self.mem_norm(final_state) * torch.tanh(self.state_gate)   # [M, D]
         mem = torch.cat([state, local_tok], dim=0)                 # [M + k*L, D]
         msk = torch.cat([torch.ones(state.size(0), device=mem.device),
                          local_msk.float()], dim=0)                # [M + k*L]
@@ -229,6 +232,7 @@ class SNaC(nn.Module):
         loss = nll + self.cfg.lambda_probe * probe
         return {"loss": loss, "nll": nll, "probe": probe,
                 "delta_mean": deltas.mean().detach(),
+                "state_gate": torch.tanh(self.state_gate).detach().abs().mean(),
                 "deltas": deltas.detach(), "ret_idx": ret_idx.detach()}
 
     # --- inference ----------------------------------------------------------
