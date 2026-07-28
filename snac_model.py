@@ -186,12 +186,15 @@ class SNaC(nn.Module):
         scores = (scene_pool @ query.t()).squeeze(-1)              # [S]
         k = min(self.cfg.k_retrieve, S)
         idx = torch.topk(scores, k).indices
-        local_tok = scene_tok[idx].reshape(-1, self.d)             # [k*L, D]
+        local_tok = scene_tok[idx].reshape(-1, self.d)             # [k*L, D] RAW
         local_msk = scene_mask[idx].reshape(-1)                    # [k*L]
 
-        mem = torch.cat([final_state, local_tok], dim=0)           # [M + k*L, D]
-        mem = self.mem_norm(mem)                                    # shared scale
-        msk = torch.cat([torch.ones(final_state.size(0), device=mem.device),
+        # Keep the retrieved tokens RAW (the distribution the decoder expects, proven
+        # by --memory_mode full). Normalize ONLY the state slots so they sit at a
+        # comparable scale and can neither hijack nor be ignored.
+        state = self.mem_norm(final_state)                         # [M, D]
+        mem = torch.cat([state, local_tok], dim=0)                 # [M + k*L, D]
+        msk = torch.cat([torch.ones(state.size(0), device=mem.device),
                          local_msk.float()], dim=0)                # [M + k*L]
         return mem.unsqueeze(0), msk.unsqueeze(0), idx             # add batch dim
 
