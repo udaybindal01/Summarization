@@ -1,17 +1,25 @@
 # SNaC — Streaming Narrative-state Compression
 
 A research-ready reimplementation for long-form movie summarization. It replaces the
-v5 LED+Mamba-hypergraph system (which was structurally unable to learn) with a clean,
-novel mechanism:
+v5 LED+Mamba-hypergraph system (which was structurally unable to learn) with a clean
+**LED whole-document** backbone plus a novel streaming state:
 
+- **Whole-document LED encoding.** The entire screenplay is encoded as one 16K-token
+  sequence with `</s>` scene separators and *global attention* on those separators.
+  The decoder cross-attends over context-aware, in-distribution encoder states — this
+  is the change that fixes the grammar/metric ceiling of the old per-scene chunking.
 - **Streaming, entity-bound story-state.** A fixed set of `M = max_entities + free_slots`
-  slots is carried scene-by-scene. Entity slots are bound to screenplay characters and
-  their writes are **addressable** — a slot only updates on scenes where its entity
-  appears, so distant facts survive (effective path length = #character-scenes, not
-  #scenes). This is what lets a betrayal planted in scene 20 reach the summary.
-- **Two-source decoder.** The decoder cross-attends to `[ final state slots (global,
-  compressed) ; retrieved top-k scenes at full token resolution (local, verbatim) ]`.
-  Global carries the arc; local gives faithful surface wording.
+  slots is carried scene-by-scene, each scene read from the LED states sliced to that
+  scene's span. Entity slots are bound to screenplay characters and their writes are
+  **addressable** — a slot only updates on scenes where its entity appears, so distant
+  facts survive (effective path length = #character-scenes, not #scenes).
+- **Memory modes (`--memory_mode`).**
+  - `full` (default, headline metrics): decoder attends the full LED encoder states —
+    a strong, in-distribution LED summariser.
+  - `two_source` (novelty): `[ gated state slots (global, compressed) ; retrieved
+    top-k scene spans at full resolution (local) ]`. The state is gated to ~0 at init,
+    so training starts from the working raw-token behaviour and the state earns its way
+    in only if it improves the summary.
 - **Probe + turning-point signals.** An entity-presence probe forces the state to be
   decodable (interpretability); `‖S_t − S_{t−1}‖` per scene is logged for turning-point
   analysis. Erasing a slot at decode time changes exactly the facts it carried
@@ -33,23 +41,28 @@ peft            # only needed for --lora
 (No spaCy/fastcoref required — entities come from screenplay ALL-CAPS cues.)
 
 ## Train on the full MovieSum train set
-Run on a GPU node (needs internet or a warm HF cache for the dataset + backbone):
+Run on a GPU node (needs internet or a warm HF cache for the dataset + LED backbone).
+Full fine-tune of the LED backbone is the reliable recipe:
 ```bash
 python3 snac_train.py \
-  --backbone facebook/bart-large-cnn \
+  --memory_mode full \
+  --train_encoder --grad_ckpt \
   --epochs 8 --grad_accum 8 \
-  --out /scratch/karan/snac
+  --out ./snac_out
 ```
 - Validates on the official `validation` split every epoch; writes `snac_best.pt`
   (best ROUGE-L) and `snac_last.pt` to `--out`.
-- Default: encoder frozen, decoder + state module trained. Add `--lora` to instead
-  LoRA-tune the backbone attention (needs `peft`).
-- Quick smoke test first: `--limit_train 50 --epochs 1 --max_eval 10`.
+- `--memory_mode full` = whole-document LED summariser (headline metrics).
+  Swap to `--memory_mode two_source --k_retrieve 12` for the streaming-state novelty
+  (starts equal to `full` via the zero-init state gate, then adapts).
+- `--train_encoder --grad_ckpt` full-tunes LED with gradient checkpointing (fits a
+  16K-token forward on a 40GB GPU in bf16). Drop `--train_encoder` to freeze the
+  encoder and train only the decoder + state; add `--lora` for LoRA (needs `peft`).
+- Quick smoke test first: `--limit_train 40 --epochs 2 --max_eval 5 --log_every 20`.
 
-Backbone is swappable: `--backbone google/flan-t5-large` (stronger, modern) or
-`allenai/led-large-16384` (long-context). BART-large-cnn is the default because it
-carries a summarization prior and uses the exact decoder-memory API path already
-verified in `prototype_bottleneck.py`.
+Backbone is swappable via `--backbone` (e.g. a local `allenai/led-large-16384` path),
+but LED-16384 is the default because it encodes the whole screenplay in-context — the
+published MovieSum recipe.
 
 ## Evaluate on the test set
 ```bash

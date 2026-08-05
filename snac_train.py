@@ -55,6 +55,7 @@ def run_eval(model, tok, movies, cfg, device, rouge, bertscore, max_eval, gen_to
 def build_config(args) -> SNaCConfig:
     return SNaCConfig(
         backbone=args.backbone, dataset=args.dataset,
+        max_doc_tokens=args.max_doc_tokens,
         max_scenes=args.max_scenes, scene_tokens=args.scene_tokens,
         max_entities=args.max_entities, free_slots=args.free_slots,
         max_target=args.max_target, k_retrieve=args.k_retrieve,
@@ -63,9 +64,9 @@ def build_config(args) -> SNaCConfig:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backbone", default="facebook/bart-large-cnn")
+    ap.add_argument("--backbone", default="allenai/led-large-16384")
     ap.add_argument("--dataset", default="moviesum")
-    ap.add_argument("--out", default="/Summarization/summary")
+    ap.add_argument("--out", default="./snac_out")
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--grad_accum", type=int, default=8)
     ap.add_argument("--lr_state", type=float, default=1e-4)
@@ -75,15 +76,17 @@ def main():
                     help="unfreeze the encoder (most reliable; matches the working prototype)")
     ap.add_argument("--grad_ckpt", action="store_true",
                     help="gradient checkpointing (saves memory when --train_encoder)")
-    ap.add_argument("--max_scenes", type=int, default=48)
-    ap.add_argument("--scene_tokens", type=int, default=256)
+    ap.add_argument("--max_doc_tokens", type=int, default=16384)
+    ap.add_argument("--max_scenes", type=int, default=80)
+    ap.add_argument("--scene_tokens", type=int, default=512)
     ap.add_argument("--max_entities", type=int, default=24)
     ap.add_argument("--free_slots", type=int, default=8)
     ap.add_argument("--max_target", type=int, default=400)
-    ap.add_argument("--k_retrieve", type=int, default=6)
-    ap.add_argument("--memory_mode", default="two_source",
-                    choices=["two_source", "full", "state_only"],
-                    help="'full' = raw scene tokens only (plumbing diagnostic)")
+    ap.add_argument("--k_retrieve", type=int, default=8)
+    ap.add_argument("--memory_mode", default="full",
+                    choices=["full", "two_source", "state_only"],
+                    help="'full' = whole LED encoder states (headline metrics); "
+                         "'two_source' = gated state + retrieved scenes (novelty)")
     ap.add_argument("--lambda_probe", type=float, default=0.3)
     ap.add_argument("--gen_tokens", type=int, default=400)
     ap.add_argument("--max_eval", type=int, default=100)
